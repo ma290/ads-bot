@@ -186,49 +186,47 @@ def force_sub_kb():
 def _fmt_interval(seconds: int) -> str:
     m, s = divmod(seconds, 60)
     if m and s:
-        return f"{m}min {s}s"
-    return f"{m}min" if m else f"{s}s"
+        return f"{m} min {s}s"
+    return f"{m} minutes" if m else f"{s}s"
 
 
 def dashboard_text(settings: dict, acct_count: int) -> str:
-    ad_ok = "Set ✅" if settings["ad_message"] else "Not Set ❌"
-    target = settings["target_type"].capitalize()
-    cycles = f"{settings['current_cycle']}/{settings['max_cycles']}"
+    svc = "__set__" if settings["ad_message"] else "__not set__"
     status_map = {
-        "paused": "Paused ⏸",
-        "running": "Running ▶️",
-        "completed": "Completed ✅",
-        "stopped": "Stopped ⏹",
+        "paused": "stopped 🔴",
+        "running": "running ▶️",
+        "completed": "completed ✅",
+        "stopped": "stopped 🔴",
     }
     status = status_map.get(settings["status"], settings["status"])
-    ai = "ON" if settings["ai_reply"] else "OFF"
+    interval_str = _fmt_interval(settings["cycle_interval"])
 
     return (
-        f"┌───→ **@{BOT_USERNAME}** Ads\n"
-        f"**DASHBOARD**\n\n"
-        f"• Hosted Accounts: **{acct_count}**\n"
-        f"• Ad Message: **{ad_ok}**\n"
-        f"• Cycle Interval: **{_fmt_interval(settings['cycle_interval'])}**\n"
-        f"• Target: **{target}**\n"
-        f"• Cycles: **{cycles}**\n"
-        f"• Status: **{status}**\n"
-        f"• AI Reply: **{ai}**\n\n"
-        f"└───→ Choose an action below"
+        f"━━━━━ **Powered by @mrvoidance** ━━━━━\n"
+        f"━━━━\n\n\n"
+        f"• **Hosted Accounts:** __{acct_count}/20__\n"
+        f"• **Service:** __{svc}__\n"
+        f"• **Advertisement status:** __{status}__\n"
+        f"• **Interval:** __{interval_str}__\n"
+        f"• **Current plan:** __free__\n\n"
+        f"> Developed and managed by: \"\"\n"
+        f"> **@mrvoidance**"
     )
 
 
 def main_menu(settings: dict):
-    ai_label = "🤖 AI Reply: ON" if settings.get("ai_reply") else "🤖 AI Reply: OFF"
-    tgt_label = f"📍 Target: {settings.get('target_type', 'groups').capitalize()}"
+    is_running = settings.get("status") == "running"
+    if is_running:
+        run_btn = Button.inline("Stop Ads ⏸", b"act_stop")
+    else:
+        run_btn = Button.inline("Run Ads ▶", b"act_start")
     return [
-        [Button.inline("➕ Add Account",    b"act_add_acct"),  Button.inline("📱 My Accounts",  b"menu_accts")],
-        [Button.inline("📝 Set Ad Message", b"act_set_ad"),    Button.inline("⏱ Set Interval",  b"act_set_intv")],
-        [Button.inline(tgt_label,           b"act_tgl_tgt"),   Button.inline("🔄 Set Cycles",   b"act_set_cyc")],
-        [Button.inline("▶️ Start Ads",      b"act_start"),     Button.inline("⏸ Stop Ads",      b"act_stop")],
-        [Button.inline("🚫 Exclude Groups", b"menu_excl"),     Button.inline(ai_label,           b"act_tgl_ai")],
-        [Button.inline("📊 Analytics",      b"menu_analytics")],
-        [Button.inline("⭐ Premium",        b"menu_premium"),  Button.inline("📦 Auto Join Grou…", b"act_autojoin")],
-        [Button.inline("🗑 Delete Accounts", b"act_del_accts")],
+        [Button.inline("Add account", b"act_add_acct")],
+        [Button.inline("Set Advertisement", b"act_set_ad"), Button.inline("Interval & delay", b"menu_interval")],
+        [run_btn],
+        [Button.inline("Auto reply", b"act_tgl_ai"), Button.inline("Auto join", b"act_autojoin")],
+        [Button.inline("Go Premium", b"menu_premium")],
+        [Button.url("About bot ↗", f"https://t.me/{BOT_USERNAME}"), Button.url("Powered by ↗", "https://t.me/mrvoidance")],
     ]
 
 # ---------------------------------------------------------------------------
@@ -369,6 +367,20 @@ async def menu_handler(event):
     if data == "menu_main":
         await _refresh_dashboard(event, uid)
 
+    # ---- Interval & delay (button-based) ----
+    elif data == "menu_interval":
+        settings = await get_settings(uid)
+        current = _fmt_interval(settings["cycle_interval"])
+        await event.edit(
+            f"⏱ **Interval & Delay**\n\n"
+            f"Current interval: **{current}**\n\n"
+            f"Select a new interval:",
+            buttons=[
+                [Button.inline("5 minutes", b"act_intv_300"), Button.inline("10 minutes", b"act_intv_600"), Button.inline("20 minutes", b"act_intv_1200")],
+                [Button.inline("🔙 Back", b"menu_main")],
+            ]
+        )
+
     # ---- My Accounts ----
     elif data == "menu_accts":
         async with db_pool.acquire() as conn:
@@ -383,7 +395,7 @@ async def menu_handler(event):
                 ico = "🟢" if r["is_active"] else "🔴"
                 txt += f"{ico} **{r['session_name']}** (`{r['phone'] or 'N/A'}`)\n"
         await event.edit(txt, buttons=[
-            [Button.inline("➕ Add Account", b"act_add_acct")],
+            [Button.inline("➕ Add Account", b"act_add_acct"), Button.inline("🗑 Delete Account", b"act_del_accts")],
             [Button.inline("🔙 Back", b"menu_main")],
         ])
 
@@ -426,7 +438,7 @@ async def menu_handler(event):
     elif data == "menu_premium":
         await event.edit(
             "⭐ **Premium Features**\n\n"
-            "• Unlimited accounts\n"
+            "• Unlimited accounts (20+)\n"
             "• Unlimited cycles\n"
             "• AI auto-reply\n"
             "• Priority support\n\n"
@@ -462,16 +474,16 @@ async def action_handler(event):
         )
         await event.answer()
 
-    # ---- Set Interval ----
-    elif data == "act_set_intv":
-        user_states[uid] = {"action": "await_interval"}
-        await event.respond(
-            "⏱ **Set Cycle Interval**\n\n"
-            "Send the delay between messages **in seconds**:\n"
-            "Example: `180` (= 3min)\n\n"
-            "Min: `30` · Max: `3600`"
-        )
-        await event.answer()
+    # ---- Set Interval (button-based, via menu_interval) ----
+    elif data.startswith("act_intv_"):
+        secs = int(data.replace("act_intv_", ""))
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE user_settings SET cycle_interval=$1 WHERE user_id=$2", secs, uid
+            )
+        mins = secs // 60
+        await event.answer(f"✅ Interval set to {mins} minutes")
+        await _refresh_dashboard(event, uid)
 
     # ---- Toggle Target Type ----
     elif data == "act_tgl_tgt":

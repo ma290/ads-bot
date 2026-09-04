@@ -1,0 +1,37 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: campaign_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: campaign_user
+      POSTGRES_PASSWORD: campaign_pass
+      POSTGRES_DB: campaign_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U campaign_user -d campaign_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  telegram-campaign-bot:
+    build: .
+    container_name: telegram_campaign_bot
+    restart: unless-stopped
+    stdin_open: true   # Necessary for interactive phone login
+    tty: true          # Necessary for OTP/password terminal prompts
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:

@@ -21,6 +21,7 @@ from telethon.errors import (
 from telethon.tl.functions.channels import GetParticipantRequest, JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.account import UpdateProfileRequest
+from telethon.tl.types import Chat, Channel
 
 # ---------------------------------------------------------------------------
 # Environment & Config
@@ -224,8 +225,8 @@ def main_menu(settings: dict):
         [Button.inline("Add account", b"act_add_acct")],
         [Button.inline("Set Advertisement", b"act_set_ad"), Button.inline("Interval & delay", b"menu_interval")],
         [run_btn],
-        [Button.inline("Auto reply", b"act_tgl_ai"), Button.inline("Auto join", b"act_autojoin")],
-        [Button.inline("Go Premium", b"menu_premium")],
+        [Button.inline("Exclude Groups 🚫", b"menu_excl"), Button.inline("Auto join", b"act_autojoin")],
+        [Button.inline("Auto reply", b"act_tgl_ai"), Button.inline("Go Premium", b"menu_premium")],
         [Button.url("About bot ↗", f"https://t.me/{BOT_USERNAME}"), Button.url("Powered by ↗", "https://t.me/mrvoidance")],
     ]
 
@@ -280,20 +281,37 @@ async def ad_worker(user_id: int) -> None:
                     "UPDATE user_settings SET current_cycle=$1 WHERE user_id=$2",
                     cycle, user_id,
                 )
-                targets = await conn.fetch(
-                    "SELECT chat_id FROM targets WHERE owner_id=$1 "
-                    "AND chat_id NOT IN (SELECT chat_id FROM excluded_groups WHERE owner_id=$1)",
-                    user_id,
+                # Fetch excluded group IDs
+                excl_rows = await conn.fetch(
+                    "SELECT chat_id FROM excluded_groups WHERE owner_id=$1", user_id
                 )
-            for row in targets:
+            excluded_ids = set()
+            for er in excl_rows:
+                excluded_ids.add(er["chat_id"])
+
+            # Fetch ALL groups/supergroups from the user's account dialogs
+            all_groups = []
+            async for dialog in uc.iter_dialogs():
+                entity = dialog.entity
+                # Include groups (Chat) and supergroups/channels that are megagroups
+                if isinstance(entity, Chat):
+                    gid = str(entity.id)
+                    if gid not in excluded_ids and f"-{gid}" not in excluded_ids:
+                        all_groups.append({"id": entity.id, "title": entity.title})
+                elif isinstance(entity, Channel) and entity.megagroup:
+                    gid = str(entity.id)
+                    if gid not in excluded_ids and f"-100{gid}" not in excluded_ids:
+                        all_groups.append({"id": entity.id, "title": entity.title})
+
+            logger.info(f"User {user_id}: cycle {cycle}/{max_cyc}, found {len(all_groups)} groups (excl {len(excluded_ids)})")
+
+            for grp in all_groups:
                 if stop and stop.is_set():
                     break
-                cid = row["chat_id"]
                 retries, ok, err = 0, False, None
                 while retries <= MAX_RETRIES and not (stop and stop.is_set()):
                     try:
-                        ent = int(cid) if cid.lstrip("-").isdigit() else cid
-                        await uc.send_message(ent, ad_msg)
+                        await uc.send_message(grp["id"], ad_msg)
                         ok = True; break
                     except FloodWaitError as e:
                         await asyncio.sleep(e.seconds); retries += 1
@@ -305,7 +323,7 @@ async def ad_worker(user_id: int) -> None:
                 async with db_pool.acquire() as conn:
                     await conn.execute(
                         "INSERT INTO ad_logs(owner_id,chat_id,status,error_message) VALUES($1,$2,$3,$4)",
-                        user_id, cid, "sent" if ok else "failed", err,
+                        user_id, str(grp["id"]), "sent" if ok else "failed", err,
                     )
                 # Random delay between messages to avoid Telegram anti-spam
                 if not (stop and stop.is_set()):
@@ -516,11 +534,8 @@ async def action_handler(event):
             await event.answer("❌ Set an ad message first!", alert=True); return
         async with db_pool.acquire() as conn:
             ac = await conn.fetchval("SELECT COUNT(*) FROM accounts WHERE owner_id=$1 AND is_active=TRUE", uid)
-            tc = await conn.fetchval("SELECT COUNT(*) FROM targets WHERE owner_id=$1", uid)
         if ac == 0:
             await event.answer("❌ Add an account first!", alert=True); return
-        if tc == 0:
-            await event.answer("❌ Add targets first! Use Auto Join Groups.", alert=True); return
 
         async with db_pool.acquire() as conn:
             await conn.execute(

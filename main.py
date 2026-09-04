@@ -18,7 +18,8 @@ from telethon.errors import (
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
 )
-from telethon.tl.functions.channels import GetParticipantRequest
+from telethon.tl.functions.channels import GetParticipantRequest, JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.account import UpdateProfileRequest
 
 # ---------------------------------------------------------------------------
@@ -27,19 +28,16 @@ from telethon.tl.functions.account import UpdateProfileRequest
 
 load_dotenv()
 
-API_ID      = int(os.getenv("API_ID", "0"))
-API_HASH    = os.getenv("API_HASH", "")
-BOT_TOKEN   = os.getenv("BOT_TOKEN", "")
+API_ID       = int(os.getenv("API_ID", "0"))
+API_HASH     = os.getenv("API_HASH", "")
+BOT_TOKEN    = os.getenv("BOT_TOKEN", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
-ADMIN_IDS   = [int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()]
 FORCE_SUB_CHANNELS = [x.strip() for x in os.getenv("FORCE_SUB_CHANNELS", "").split(",") if x.strip()]
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+MAX_RETRIES  = int(os.getenv("MAX_RETRIES", "3"))
+MIN_DELAY    = int(os.getenv("MIN_DELAY", "15"))
+MAX_DELAY    = int(os.getenv("MAX_DELAY", "40"))
 
-MIN_DELAY   = int(os.getenv("MIN_DELAY", "15"))
-MAX_DELAY   = int(os.getenv("MAX_DELAY", "45"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
-
-# DATA_DIR used only for user Telethon .session files when running locally
 DATA_DIR = os.path.abspath("data")
 os.makedirs(DATA_DIR, exist_ok=True)
 LOG_PATH = os.path.join(DATA_DIR, "app.log")
@@ -56,22 +54,23 @@ logging.basicConfig(
         logging.StreamHandler(sys.stdout),
     ],
 )
-logger = logging.getLogger("CampaignBot")
+logger = logging.getLogger("AdsBot")
 
 # ---------------------------------------------------------------------------
-# Global state  (bot_client is created inside main() — NOT at module level)
+# Global State
 # ---------------------------------------------------------------------------
 
 db_pool: asyncpg.Pool = None
-bot_client: TelegramClient = None   # initialised in main() after env validation
+bot_client: TelegramClient = None
 
-active_campaign_task: asyncio.Task = None
-campaign_stop_event: asyncio.Event = None
+# Per-user running tasks  {user_id: asyncio.Task}
+active_tasks: dict = {}
+stop_events: dict = {}   # {user_id: asyncio.Event}
 
-user_states: dict = {}
+user_states: dict = {}   # conversational state machine
 
 # ---------------------------------------------------------------------------
-# Database — Initialisation
+# Database
 # ---------------------------------------------------------------------------
 
 async def init_db(pool: asyncpg.Pool) -> None:
@@ -80,50 +79,81 @@ async def init_db(pool: asyncpg.Pool) -> None:
             CREATE TABLE IF NOT EXISTS accounts (
                 session_name TEXT PRIMARY KEY,
                 phone        TEXT,
+                owner_id     BIGINT NOT NULL,
                 is_active    BOOLEAN NOT NULL DEFAULT TRUE,
                 created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
         await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id        BIGINT PRIMARY KEY,
+                ad_message     TEXT,
+                cycle_interval INTEGER NOT NULL DEFAULT 180,
+                target_type    TEXT    NOT NULL DEFAULT 'groups',
+                max_cycles     INTEGER NOT NULL DEFAULT 5,
+                current_cycle  INTEGER NOT NULL DEFAULT 0,
+                status         TEXT    NOT NULL DEFAULT 'paused',
+                ai_reply       BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS targets (
-                chat_id    TEXT PRIMARY KEY,
-                title      TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS templates (
                 id         SERIAL PRIMARY KEY,
-                name       TEXT UNIQUE NOT NULL,
-                content    TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                chat_id    TEXT   NOT NULL,
+                title      TEXT,
+                owner_id   BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (owner_id, chat_id)
             )
         """)
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS campaigns (
-                id           SERIAL PRIMARY KEY,
-                name         TEXT UNIQUE NOT NULL,
-                template_id  INTEGER REFERENCES templates(id),
-                session_name TEXT    REFERENCES accounts(session_name),
-                status       TEXT    NOT NULL DEFAULT 'stopped',
-                created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            CREATE TABLE IF NOT EXISTS excluded_groups (
+                id       SERIAL PRIMARY KEY,
+                chat_id  TEXT   NOT NULL,
+                title    TEXT,
+                owner_id BIGINT NOT NULL,
+                UNIQUE (owner_id, chat_id)
             )
         """)
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS campaign_logs (
-                id             SERIAL PRIMARY KEY,
-                campaign_id    INTEGER REFERENCES campaigns(id),
-                chat_id        TEXT,
-                status         TEXT,
-                error_message  TEXT,
-                attempt_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE (campaign_id, chat_id)
+            CREATE TABLE IF NOT EXISTS ad_logs (
+                id            SERIAL PRIMARY KEY,
+                owner_id      BIGINT NOT NULL,
+                chat_id       TEXT,
+                status        TEXT,
+                error_message TEXT,
+                sent_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        # ---- Migrations for pre-existing tables ----
+        for tbl in ("accounts", "targets"):
+            await conn.execute(f"""
+                DO $$ BEGIN
+                    ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS owner_id BIGINT;
+                EXCEPTION WHEN others THEN NULL;
+                END $$;
+            """)
     logger.info("Database tables verified / created.")
 
+
+async def get_settings(user_id: int) -> dict:
+    """Return user settings, creating a default row on first visit."""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM user_settings WHERE user_id = $1", user_id
+        )
+        if not row:
+            await conn.execute(
+                "INSERT INTO user_settings (user_id) VALUES ($1) ON CONFLICT DO NOTHING",
+                user_id,
+            )
+            row = await conn.fetchrow(
+                "SELECT * FROM user_settings WHERE user_id = $1", user_id
+            )
+    return dict(row)
+
 # ---------------------------------------------------------------------------
-# Force Subscription Helpers
+# Force-Subscription Helpers
 # ---------------------------------------------------------------------------
 
 async def check_force_sub(user_id: int) -> bool:
@@ -136,271 +166,285 @@ async def check_force_sub(user_id: int) -> bool:
         except (UserNotParticipantError, ValueError):
             return False
         except Exception as e:
-            logger.warning(f"Error checking channel subscription for {channel}: {e}")
+            logger.warning(f"Force-sub check error for {channel}: {e}")
             return False
     return True
 
 
-def get_force_sub_keyboard():
+def force_sub_kb():
     buttons = []
     for i, ch in enumerate(FORCE_SUB_CHANNELS[:3], 1):
-        clean_name = ch.replace("@", "")
-        buttons.append([Button.url(f"🔗 Join Channel {i}", f"https://t.me/{clean_name}")])
+        clean = ch.replace("@", "")
+        buttons.append([Button.url(f"🔗 Join Channel {i}", f"https://t.me/{clean}")])
     buttons.append([Button.inline("✅ I have joined all channels", b"verify_sub")])
     return buttons
 
 # ---------------------------------------------------------------------------
-# Control Panel Keyboard
+# Dashboard Text & Main-Menu Keyboard
 # ---------------------------------------------------------------------------
 
-def get_main_menu():
+def _fmt_interval(seconds: int) -> str:
+    m, s = divmod(seconds, 60)
+    if m and s:
+        return f"{m}min {s}s"
+    return f"{m}min" if m else f"{s}s"
+
+
+def dashboard_text(settings: dict, acct_count: int) -> str:
+    ad_ok = "Set ✅" if settings["ad_message"] else "Not Set ❌"
+    target = settings["target_type"].capitalize()
+    cycles = f"{settings['current_cycle']}/{settings['max_cycles']}"
+    status_map = {
+        "paused": "Paused ⏸",
+        "running": "Running ▶️",
+        "completed": "Completed ✅",
+        "stopped": "Stopped ⏹",
+    }
+    status = status_map.get(settings["status"], settings["status"])
+    ai = "ON" if settings["ai_reply"] else "OFF"
+
+    return (
+        f"┌───→ **@{BOT_USERNAME}** Ads\n"
+        f"**DASHBOARD**\n\n"
+        f"• Hosted Accounts: **{acct_count}**\n"
+        f"• Ad Message: **{ad_ok}**\n"
+        f"• Cycle Interval: **{_fmt_interval(settings['cycle_interval'])}**\n"
+        f"• Target: **{target}**\n"
+        f"• Cycles: **{cycles}**\n"
+        f"• Status: **{status}**\n"
+        f"• AI Reply: **{ai}**\n\n"
+        f"└───→ Choose an action below"
+    )
+
+
+def main_menu(settings: dict):
+    ai_label = "🤖 AI Reply: ON" if settings.get("ai_reply") else "🤖 AI Reply: OFF"
+    tgt_label = f"📍 Target: {settings.get('target_type', 'groups').capitalize()}"
     return [
-        [Button.inline("📊 Campaign Status", b"menu_status"), Button.inline("▶️ Start Campaign", b"menu_start")],
-        [Button.inline("⏹️ Stop Campaign",   b"menu_stop"),   Button.inline("📈 View Stats",     b"menu_stats")],
-        [Button.inline("🎯 Manage Targets",  b"menu_targets"),Button.inline("📝 Manage Templates",b"menu_templates")],
-        [Button.inline("👤 Manage Accounts", b"menu_accounts")],
+        [Button.inline("➕ Add Account",    b"act_add_acct"),  Button.inline("📱 My Accounts",  b"menu_accts")],
+        [Button.inline("📝 Set Ad Message", b"act_set_ad"),    Button.inline("⏱ Set Interval",  b"act_set_intv")],
+        [Button.inline(tgt_label,           b"act_tgl_tgt"),   Button.inline("🔄 Set Cycles",   b"act_set_cyc")],
+        [Button.inline("▶️ Start Ads",      b"act_start"),     Button.inline("⏸ Stop Ads",      b"act_stop")],
+        [Button.inline("🚫 Exclude Groups", b"menu_excl"),     Button.inline(ai_label,           b"act_tgl_ai")],
+        [Button.inline("📊 Analytics",      b"menu_analytics")],
+        [Button.inline("⭐ Premium",        b"menu_premium"),  Button.inline("📦 Auto Join Grou…", b"act_autojoin")],
+        [Button.inline("🗑 Delete Accounts", b"act_del_accts")],
     ]
 
 # ---------------------------------------------------------------------------
-# Campaign Dispatch Engine
+# Helper: refresh & edit dashboard into current message
 # ---------------------------------------------------------------------------
 
-async def run_campaign_worker(campaign_id: int) -> None:
-    global campaign_stop_event
-    logger.info(f"Worker initiated for campaign ID: {campaign_id}")
+async def _refresh_dashboard(event, user_id: int):
+    settings = await get_settings(user_id)
+    async with db_pool.acquire() as conn:
+        cnt = await conn.fetchval(
+            "SELECT COUNT(*) FROM accounts WHERE owner_id=$1", user_id
+        )
+    await event.edit(dashboard_text(settings, cnt), buttons=main_menu(settings))
+
+# ---------------------------------------------------------------------------
+# Ad Dispatch Worker  (one per user)
+# ---------------------------------------------------------------------------
+
+async def ad_worker(user_id: int) -> None:
+    logger.info(f"Ad worker started for user {user_id}")
+    stop = stop_events.get(user_id)
+
+    settings = await get_settings(user_id)
+    ad_msg   = settings["ad_message"]
+    max_cyc  = settings["max_cycles"]
+    interval = settings["cycle_interval"]  # delay between full cycles
+
+    if not ad_msg:
+        logger.error(f"User {user_id}: no ad message."); return
 
     async with db_pool.acquire() as conn:
-        camp = await conn.fetchrow(
-            "SELECT template_id, session_name FROM campaigns WHERE id = $1", campaign_id
+        acct = await conn.fetchrow(
+            "SELECT session_name FROM accounts WHERE owner_id=$1 AND is_active=TRUE LIMIT 1",
+            user_id,
         )
-        if not camp:
-            logger.error(f"Campaign {campaign_id} does not exist.")
-            return
-        template_id, session_name = camp["template_id"], camp["session_name"]
-        tmpl = await conn.fetchrow("SELECT content FROM templates WHERE id = $1", template_id)
-        message_content = tmpl["content"] if tmpl else None
+    if not acct:
+        logger.error(f"User {user_id}: no active account."); return
 
-    if not message_content:
-        logger.error("Message template is empty or missing — aborting.")
-        return
-
-    user_client = TelegramClient(os.path.join(DATA_DIR, session_name), API_ID, API_HASH)
-    await user_client.connect()
-
-    if not await user_client.is_user_authorized():
-        logger.error(f"User session '{session_name}' is unauthorized.")
-        await user_client.disconnect()
-        return
+    sess = acct["session_name"]
+    uc = TelegramClient(os.path.join(DATA_DIR, sess), API_ID, API_HASH)
+    await uc.connect()
+    if not await uc.is_user_authorized():
+        logger.error(f"Session '{sess}' unauthorized."); await uc.disconnect(); return
 
     try:
-        async with db_pool.acquire() as conn:
-            all_targets = await conn.fetch("SELECT chat_id, title FROM targets")
-
-        for row in all_targets:
-            chat_id, title = row["chat_id"], row["title"]
-            if campaign_stop_event.is_set():
+        for cycle in range(1, max_cyc + 1):
+            if stop and stop.is_set():
                 break
-
             async with db_pool.acquire() as conn:
-                existing = await conn.fetchrow(
-                    "SELECT status FROM campaign_logs WHERE campaign_id=$1 AND chat_id=$2",
-                    campaign_id, chat_id,
+                await conn.execute(
+                    "UPDATE user_settings SET current_cycle=$1 WHERE user_id=$2",
+                    cycle, user_id,
                 )
-            if existing and existing["status"] == "sent":
-                logger.info(f"Chat {chat_id} already received campaign #{campaign_id}. Skipping.")
-                continue
-
-            retries, success, error_msg = 0, False, None
-            while retries <= MAX_RETRIES and not campaign_stop_event.is_set():
-                try:
-                    target_entity = (
-                        int(chat_id) if chat_id.startswith("-100") or chat_id.lstrip("-").isdigit()
-                        else chat_id
-                    )
-                    await user_client.send_message(target_entity, message_content)
-                    success = True
+                targets = await conn.fetch(
+                    "SELECT chat_id FROM targets WHERE owner_id=$1 "
+                    "AND chat_id NOT IN (SELECT chat_id FROM excluded_groups WHERE owner_id=$1)",
+                    user_id,
+                )
+            for row in targets:
+                if stop and stop.is_set():
                     break
-                except FloodWaitError as e:
-                    await asyncio.sleep(e.seconds); retries += 1
-                except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError) as e:
-                    error_msg = f"Forbidden: {e}"; break
-                except Exception as e:
-                    error_msg = str(e); retries += 1
-                    await asyncio.sleep((2 ** retries) * 2)
-
-            status_entry = "sent" if success else "failed"
-            async with db_pool.acquire() as conn:
-                await conn.execute("""
-                    INSERT INTO campaign_logs (campaign_id, chat_id, status, error_message, attempt_at)
-                    VALUES ($1,$2,$3,$4,NOW())
-                    ON CONFLICT (campaign_id, chat_id) DO UPDATE
-                        SET status=EXCLUDED.status, error_message=EXCLUDED.error_message, attempt_at=NOW()
-                """, campaign_id, chat_id, status_entry, error_msg)
-
-            if not campaign_stop_event.is_set():
-                await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+                cid = row["chat_id"]
+                retries, ok, err = 0, False, None
+                while retries <= MAX_RETRIES and not (stop and stop.is_set()):
+                    try:
+                        ent = int(cid) if cid.lstrip("-").isdigit() else cid
+                        await uc.send_message(ent, ad_msg)
+                        ok = True; break
+                    except FloodWaitError as e:
+                        await asyncio.sleep(e.seconds); retries += 1
+                    except (ChatWriteForbiddenError, UserBannedInChannelError, ChannelPrivateError) as e:
+                        err = str(e); break
+                    except Exception as e:
+                        err = str(e); retries += 1
+                        await asyncio.sleep((2 ** retries) * 2)
+                async with db_pool.acquire() as conn:
+                    await conn.execute(
+                        "INSERT INTO ad_logs(owner_id,chat_id,status,error_message) VALUES($1,$2,$3,$4)",
+                        user_id, cid, "sent" if ok else "failed", err,
+                    )
+                # Random delay between messages to avoid Telegram anti-spam
+                if not (stop and stop.is_set()):
+                    delay = random.uniform(MIN_DELAY, MAX_DELAY)
+                    logger.debug(f"User {user_id}: sleeping {delay:.1f}s before next message")
+                    await asyncio.sleep(delay)
+            # Delay between cycles
+            if cycle < max_cyc and not (stop and stop.is_set()):
+                logger.info(f"User {user_id}: cycle {cycle}/{max_cyc} done, sleeping {interval}s before next cycle")
+                await asyncio.sleep(interval)
     finally:
-        final_status = "stopped" if campaign_stop_event.is_set() else "completed"
+        final = "stopped" if (stop and stop.is_set()) else "completed"
         async with db_pool.acquire() as conn:
-            await conn.execute("UPDATE campaigns SET status=$1 WHERE id=$2", final_status, campaign_id)
-        await user_client.disconnect()
-        logger.info(f"Campaign {campaign_id} finished: {final_status}.")
+            await conn.execute(
+                "UPDATE user_settings SET status=$1 WHERE user_id=$2", final, user_id,
+            )
+        await uc.disconnect()
+        active_tasks.pop(user_id, None)
+        stop_events.pop(user_id, None)
+        logger.info(f"Ad worker user {user_id} → {final}")
 
 # ---------------------------------------------------------------------------
-# Event Handler Functions  (registered via add_event_handler inside main())
+# /start
 # ---------------------------------------------------------------------------
 
 async def start_handler(event):
-    user_id = event.sender_id
-    if not await check_force_sub(user_id):
+    uid = event.sender_id
+    if not await check_force_sub(uid):
         await event.respond(
             "⚠️ **Access Required**\n\nJoin all channels to use this bot:",
-            buttons=get_force_sub_keyboard()
+            buttons=force_sub_kb(),
         )
         return
-    await event.respond(
-        "🎛️ **Welcome to Campaign Management Control Panel**\n\n"
-        "Use the buttons below to manage targets, templates, accounts, and campaigns.",
-        buttons=get_main_menu()
-    )
+    settings = await get_settings(uid)
+    async with db_pool.acquire() as conn:
+        cnt = await conn.fetchval("SELECT COUNT(*) FROM accounts WHERE owner_id=$1", uid)
+    await event.respond(dashboard_text(settings, cnt), buttons=main_menu(settings))
 
+# ---------------------------------------------------------------------------
+# Callback: verify subscription
+# ---------------------------------------------------------------------------
 
 async def verify_sub_handler(event):
-    if await check_force_sub(event.sender_id):
-        await event.edit("✅ **Verified!** Welcome:", buttons=get_main_menu())
+    uid = event.sender_id
+    if await check_force_sub(uid):
+        await _refresh_dashboard(event, uid)
     else:
         await event.answer("❌ You haven't joined all channels yet!", alert=True)
 
+# ---------------------------------------------------------------------------
+# Callback: menu_* navigation
+# ---------------------------------------------------------------------------
 
-async def menu_navigation_handler(event):
-    data = event.data.decode("utf-8")
+async def menu_handler(event):
+    uid  = event.sender_id
+    data = event.data.decode()
 
-    if data == "menu_status":
+    # ---- Dashboard (back button) ----
+    if data == "menu_main":
+        await _refresh_dashboard(event, uid)
+
+    # ---- My Accounts ----
+    elif data == "menu_accts":
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT id, name, status, session_name FROM campaigns ORDER BY id DESC LIMIT 5"
+                "SELECT session_name, phone, is_active FROM accounts WHERE owner_id=$1", uid
             )
-        text = "📋 No campaigns found." if not rows else (
-            "📋 **Recent Campaigns:**\n\n" +
-            "".join(f"• **ID {r['id']} — {r['name']}**\n  Status: `{r['status']}` | Account: `{r['session_name']}`\n" for r in rows)
-        )
-        await event.edit(text, buttons=[[Button.inline("🔙 Back", b"menu_main")]])
-
-    elif data == "menu_stats":
-        async with db_pool.acquire() as conn:
-            stats_rows = await conn.fetch("SELECT status, COUNT(*) AS cnt FROM campaign_logs GROUP BY status")
-            target_count = await conn.fetchval("SELECT COUNT(*) FROM targets")
-        stats = {r["status"]: r["cnt"] for r in stats_rows}
-        text = (
-            "📈 **Aggregated Statistics**\n\n"
-            f"• **Targets:** `{target_count}`\n"
-            f"• **Sent:** `{stats.get('sent', 0)}`\n"
-            f"• **Failed:** `{stats.get('failed', 0)}`\n"
-        )
-        await event.edit(text, buttons=[[Button.inline("🔙 Back", b"menu_main")]])
-
-    elif data == "menu_targets":
-        async with db_pool.acquire() as conn:
-            targets = await conn.fetch("SELECT chat_id, title FROM targets")
-        text = f"🎯 **Targets ({len(targets)}):**\n\n"
-        for r in targets[:10]:
-            text += f"• `{r['chat_id']}`: {r['title']}\n"
-        if len(targets) > 10:
-            text += f"\n_…and {len(targets)-10} more._"
-        await event.edit(text, buttons=[
-            [Button.inline("➕ Add Target", b"act_add_target"), Button.inline("🗑️ Remove Target", b"act_rm_target")],
-            [Button.inline("🔙 Back", b"menu_main")],
-        ])
-
-    elif data == "menu_templates":
-        async with db_pool.acquire() as conn:
-            templates = await conn.fetch("SELECT id, name FROM templates")
-        text = f"📝 **Templates ({len(templates)}):**\n\n" + "".join(f"• **#{r['id']}**: {r['name']}\n" for r in templates)
-        await event.edit(text, buttons=[
-            [Button.inline("➕ Add Template", b"act_add_template")],
-            [Button.inline("🔙 Back", b"menu_main")],
-        ])
-
-    elif data == "menu_accounts":
-        async with db_pool.acquire() as conn:
-            accounts = await conn.fetch("SELECT session_name, phone, is_active FROM accounts")
-        text = f"👤 **Accounts ({len(accounts)}):**\n\n"
-        for r in accounts:
-            icon = "🟢" if r["is_active"] else "🔴"
-            text += f"{icon} **{r['session_name']}** ({r['phone'] or 'N/A'})\n"
-        await event.edit(text, buttons=[
-            [Button.inline("➕ Add Account", b"act_add_account")],
-            [Button.inline("🔙 Back", b"menu_main")],
-        ])
-
-    elif data == "menu_start":
-        async with db_pool.acquire() as conn:
-            camps = await conn.fetch("SELECT id, name FROM campaigns WHERE status IN ('stopped','pending')")
-        if not camps:
-            await event.edit(
-                "ℹ️ No campaigns ready. Create one first.",
-                buttons=[[Button.inline("➕ Create Campaign", b"act_create_campaign")],
-                         [Button.inline("🔙 Back", b"menu_main")]]
-            )
-            return
-        buttons = [[Button.inline(f"▶️ {r['name']}", f"run_camp_{r['id']}".encode())] for r in camps]
-        buttons.append([Button.inline("🔙 Back", b"menu_main")])
-        await event.edit("🚀 **Select a Campaign to Launch:**", buttons=buttons)
-
-    elif data == "menu_stop":
-        global active_campaign_task, campaign_stop_event
-        if active_campaign_task and not active_campaign_task.done():
-            campaign_stop_event.set()
-            await event.edit("⏹️ Stop signal sent.", buttons=[[Button.inline("🔙 Back", b"menu_main")]])
+        if not rows:
+            txt = "📱 **My Accounts**\n\nNo accounts added yet."
         else:
-            await event.edit("ℹ️ No campaign running.", buttons=[[Button.inline("🔙 Back", b"menu_main")]])
+            txt = f"📱 **My Accounts ({len(rows)}):**\n\n"
+            for r in rows:
+                ico = "🟢" if r["is_active"] else "🔴"
+                txt += f"{ico} **{r['session_name']}** (`{r['phone'] or 'N/A'}`)\n"
+        await event.edit(txt, buttons=[
+            [Button.inline("➕ Add Account", b"act_add_acct")],
+            [Button.inline("🔙 Back", b"menu_main")],
+        ])
 
-    elif data == "menu_main":
-        await event.edit("🎛️ **Campaign Management Control Panel**", buttons=get_main_menu())
+    # ---- Exclude Groups ----
+    elif data == "menu_excl":
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT chat_id, title FROM excluded_groups WHERE owner_id=$1", uid
+            )
+        if not rows:
+            txt = "🚫 **Excluded Groups**\n\nNo groups excluded."
+        else:
+            txt = f"🚫 **Excluded Groups ({len(rows)}):**\n\n"
+            for r in rows[:15]:
+                txt += f"• `{r['chat_id']}` — {r['title'] or 'N/A'}\n"
+            if len(rows) > 15:
+                txt += f"\n_…and {len(rows)-15} more._"
+        await event.edit(txt, buttons=[
+            [Button.inline("➕ Add", b"act_add_excl"), Button.inline("🗑 Remove", b"act_rm_excl")],
+            [Button.inline("🔙 Back", b"menu_main")],
+        ])
 
+    # ---- Analytics ----
+    elif data == "menu_analytics":
+        async with db_pool.acquire() as conn:
+            sent   = await conn.fetchval("SELECT COUNT(*) FROM ad_logs WHERE owner_id=$1 AND status='sent'", uid)
+            failed = await conn.fetchval("SELECT COUNT(*) FROM ad_logs WHERE owner_id=$1 AND status='failed'", uid)
+            tgts   = await conn.fetchval("SELECT COUNT(*) FROM targets WHERE owner_id=$1", uid)
+            accts  = await conn.fetchval("SELECT COUNT(*) FROM accounts WHERE owner_id=$1", uid)
+        txt = (
+            "📊 **Analytics**\n\n"
+            f"• Accounts: **{accts}**\n"
+            f"• Targets: **{tgts}**\n"
+            f"• Messages Sent: **{sent}**\n"
+            f"• Failed: **{failed}**\n"
+        )
+        await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"menu_main")]])
 
-async def trigger_run_campaign(event):
-    global active_campaign_task, campaign_stop_event
-    cid = int(event.data.decode().split("_")[-1])
-    if active_campaign_task and not active_campaign_task.done():
-        await event.answer("⚠️ Another campaign is already running!", alert=True)
-        return
-    async with db_pool.acquire() as conn:
-        await conn.execute("UPDATE campaigns SET status='running' WHERE id=$1", cid)
-    campaign_stop_event.clear()
-    active_campaign_task = asyncio.create_task(run_campaign_worker(cid))
-    await event.edit(
-        f"🚀 **Campaign #{cid} launched.**",
-        buttons=[[Button.inline("📊 Status", b"menu_status")], [Button.inline("⏹️ Stop", b"menu_stop")]]
-    )
+    # ---- Premium ----
+    elif data == "menu_premium":
+        await event.edit(
+            "⭐ **Premium Features**\n\n"
+            "• Unlimited accounts\n"
+            "• Unlimited cycles\n"
+            "• AI auto-reply\n"
+            "• Priority support\n\n"
+            "Contact admin for premium access.",
+            buttons=[[Button.inline("🔙 Back", b"menu_main")]],
+        )
 
+# ---------------------------------------------------------------------------
+# Callback: act_* actions
+# ---------------------------------------------------------------------------
 
-async def action_trigger(event):
-    user_id = event.sender_id
-    action = event.data.decode()
+async def action_handler(event):
+    uid  = event.sender_id
+    data = event.data.decode()
 
-    if action == "act_add_target":
-        user_states[user_id] = {"action": "await_target"}
-        await event.respond("Send: `<chat_id_or_username> | <Title>`\nExample: `@group | My Group`")
-        await event.answer()
-
-    elif action == "act_rm_target":
-        user_states[user_id] = {"action": "await_rm_target"}
-        await event.respond("Send the Chat ID to remove:")
-        await event.answer()
-
-    elif action == "act_add_template":
-        user_states[user_id] = {"action": "await_template"}
-        await event.respond("Send: `<Name> :: <Content>`\nExample: `Promo :: Hello! Visit https://example.com`")
-        await event.answer()
-
-    elif action == "act_create_campaign":
-        user_states[user_id] = {"action": "await_create_campaign"}
-        await event.respond("Send: `<Name> | <TemplateID> | <SessionName>`\nExample: `Sale | 1 | main_account`")
-        await event.answer()
-
-    elif action == "act_add_account":
-        user_states[user_id] = {"action": "await_account_phone"}
+    # ---- Add Account ----
+    if data == "act_add_acct":
+        user_states[uid] = {"action": "await_phone"}
         await event.respond(
             "📱 **Add Telegram Account**\n\n"
             "Send the phone number in **international format**:\n"
@@ -408,94 +452,313 @@ async def action_trigger(event):
         )
         await event.answer()
 
+    # ---- Set Ad Message ----
+    elif data == "act_set_ad":
+        user_states[uid] = {"action": "await_ad_msg"}
+        await event.respond(
+            "📝 **Set Ad Message**\n\n"
+            "Send your ad message below.\n"
+            "Supports **bold**, __italic__, `code`, and links."
+        )
+        await event.answer()
 
-async def conversational_text_handler(event):
-    user_id = event.sender_id
-    if user_id not in user_states:
+    # ---- Set Interval ----
+    elif data == "act_set_intv":
+        user_states[uid] = {"action": "await_interval"}
+        await event.respond(
+            "⏱ **Set Cycle Interval**\n\n"
+            "Send the delay between messages **in seconds**:\n"
+            "Example: `180` (= 3min)\n\n"
+            "Min: `30` · Max: `3600`"
+        )
+        await event.answer()
+
+    # ---- Toggle Target Type ----
+    elif data == "act_tgl_tgt":
+        s = await get_settings(uid)
+        new = "channels" if s["target_type"] == "groups" else "groups"
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE user_settings SET target_type=$1 WHERE user_id=$2", new, uid)
+        s["target_type"] = new
+        await event.answer(f"Target → {new.capitalize()}")
+        await _refresh_dashboard(event, uid)
+
+    # ---- Set Cycles ----
+    elif data == "act_set_cyc":
+        user_states[uid] = {"action": "await_cycles"}
+        await event.respond(
+            "🔄 **Set Cycles**\n\n"
+            "How many times to loop through all targets?\n"
+            "Example: `5`\n\n"
+            "Min: `1` · Max: `100`"
+        )
+        await event.answer()
+
+    # ---- Start Ads ----
+    elif data == "act_start":
+        if uid in active_tasks and not active_tasks[uid].done():
+            await event.answer("⚠️ Ads already running!", alert=True)
+            return
+        s = await get_settings(uid)
+        if not s["ad_message"]:
+            await event.answer("❌ Set an ad message first!", alert=True); return
+        async with db_pool.acquire() as conn:
+            ac = await conn.fetchval("SELECT COUNT(*) FROM accounts WHERE owner_id=$1 AND is_active=TRUE", uid)
+            tc = await conn.fetchval("SELECT COUNT(*) FROM targets WHERE owner_id=$1", uid)
+        if ac == 0:
+            await event.answer("❌ Add an account first!", alert=True); return
+        if tc == 0:
+            await event.answer("❌ Add targets first! Use Auto Join Groups.", alert=True); return
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE user_settings SET status='running', current_cycle=0 WHERE user_id=$1", uid
+            )
+        stop_events[uid] = asyncio.Event()
+        active_tasks[uid] = asyncio.create_task(ad_worker(uid))
+        await event.answer("▶️ Ads started!")
+        await _refresh_dashboard(event, uid)
+
+    # ---- Stop Ads ----
+    elif data == "act_stop":
+        if uid in active_tasks and not active_tasks[uid].done():
+            stop_events[uid].set()
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE user_settings SET status='paused' WHERE user_id=$1", uid)
+            await event.answer("⏸ Stopping ads…")
+            await _refresh_dashboard(event, uid)
+        else:
+            await event.answer("ℹ️ No ads running.", alert=True)
+
+    # ---- Toggle AI Reply ----
+    elif data == "act_tgl_ai":
+        s = await get_settings(uid)
+        new_val = not s["ai_reply"]
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE user_settings SET ai_reply=$1 WHERE user_id=$2", new_val, uid)
+        await event.answer(f"AI Reply: {'ON' if new_val else 'OFF'}")
+        await _refresh_dashboard(event, uid)
+
+    # ---- Exclude: add ----
+    elif data == "act_add_excl":
+        user_states[uid] = {"action": "await_add_excl"}
+        await event.respond(
+            "🚫 Send: `<chat_id_or_username> | <Title>`\n"
+            "Example: `@group | My Group`"
+        )
+        await event.answer()
+
+    # ---- Exclude: remove ----
+    elif data == "act_rm_excl":
+        user_states[uid] = {"action": "await_rm_excl"}
+        await event.respond("Send the Chat ID to remove from exclusions:")
+        await event.answer()
+
+    # ---- Auto Join Groups ----
+    elif data == "act_autojoin":
+        user_states[uid] = {"action": "await_autojoin"}
+        await event.respond(
+            "📦 **Auto Join Groups**\n\n"
+            "Send group/channel links, one per line:\n"
+            "`https://t.me/group1`\n"
+            "`https://t.me/group2`\n\n"
+            "The bot will join using your account and add them as targets."
+        )
+        await event.answer()
+
+    # ---- Delete Accounts ----
+    elif data == "act_del_accts":
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT session_name, phone FROM accounts WHERE owner_id=$1", uid
+            )
+        if not rows:
+            await event.answer("ℹ️ No accounts to delete.", alert=True); return
+        btns = []
+        for r in rows:
+            lbl = f"🗑 {r['session_name']} ({r['phone']})"
+            btns.append([Button.inline(lbl, f"delacc_{r['session_name']}".encode())])
+        btns.append([Button.inline("🔙 Back", b"menu_main")])
+        await event.edit("🗑 **Select account to delete:**", buttons=btns)
+
+# ---------------------------------------------------------------------------
+# Callback: delacc_* — confirm-delete a single account
+# ---------------------------------------------------------------------------
+
+async def del_acct_handler(event):
+    uid  = event.sender_id
+    sess = event.data.decode().replace("delacc_", "", 1)
+    async with db_pool.acquire() as conn:
+        ok = await conn.fetchval(
+            "SELECT 1 FROM accounts WHERE session_name=$1 AND owner_id=$2", sess, uid
+        )
+        if not ok:
+            await event.answer("❌ Not found.", alert=True); return
+        await conn.execute(
+            "DELETE FROM accounts WHERE session_name=$1 AND owner_id=$2", sess, uid
+        )
+    path = os.path.join(DATA_DIR, sess + ".session")
+    if os.path.exists(path):
+        os.remove(path)
+    await event.answer(f"✅ {sess} deleted.")
+    await _refresh_dashboard(event, uid)
+
+# ---------------------------------------------------------------------------
+# Text handler — conversational state machine
+# ---------------------------------------------------------------------------
+
+async def text_handler(event):
+    uid = event.sender_id
+    # Skip commands — they have their own handlers
+    if event.text and event.text.startswith("/"):
+        return
+    if uid not in user_states:
         return
 
-    state = user_states.pop(user_id)
+    state  = user_states.pop(uid)
     action = state.get("action")
-    text = event.text.strip()
+    text   = event.text.strip()
+    back_btn = [[Button.inline("🔙 Dashboard", b"menu_main")]]
 
-    # --- Add Target ---
-    if action == "await_target":
-        if "|" not in text:
-            await event.respond("❌ Invalid format. Use `<chat_id> | <Title>`.")
-            return
-        chat_id, title = [p.strip() for p in text.split("|", 1)]
+    # ---- Set Ad Message ----
+    if action == "await_ad_msg":
         async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO targets (chat_id, title) VALUES ($1,$2)
-                ON CONFLICT (chat_id) DO UPDATE SET title=EXCLUDED.title
-            """, chat_id, title)
-        await event.respond(f"✅ Target `{title}` saved.", buttons=get_main_menu())
-
-    # --- Remove Target ---
-    elif action == "await_rm_target":
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM targets WHERE chat_id=$1", text)
-        await event.respond(f"✅ Target `{text}` removed.", buttons=get_main_menu())
-
-    # --- Add Template ---
-    elif action == "await_template":
-        if "::" not in text:
-            await event.respond("❌ Invalid format. Use `Name :: Content`.")
-            return
-        name, content = [p.strip() for p in text.split("::", 1)]
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO templates (name, content) VALUES ($1,$2)
-                ON CONFLICT (name) DO UPDATE SET content=EXCLUDED.content
-            """, name, content)
-        await event.respond(f"✅ Template `{name}` saved.", buttons=get_main_menu())
-
-    # --- Create Campaign ---
-    elif action == "await_create_campaign":
-        parts = [p.strip() for p in text.split("|")]
-        if len(parts) != 3:
-            await event.respond("❌ Expected `<Name> | <TemplateID> | <SessionName>`.")
-            return
-        name, tid_str, session = parts
-        try:
-            tid = int(tid_str)
-        except ValueError:
-            await event.respond("❌ TemplateID must be a number.")
-            return
-        async with db_pool.acquire() as conn:
-            if not await conn.fetchval("SELECT 1 FROM templates WHERE id=$1", tid):
-                await event.respond(f"❌ Template ID `{tid}` not found.")
-                return
-            if not await conn.fetchval("SELECT 1 FROM accounts WHERE session_name=$1", session):
-                await event.respond(f"❌ Session `{session}` not found. Add the account first.")
-                return
             await conn.execute(
-                "INSERT INTO campaigns (name, template_id, session_name) VALUES ($1,$2,$3)",
-                name, tid, session
+                "UPDATE user_settings SET ad_message=$1 WHERE user_id=$2", text, uid
             )
-        await event.respond(f"✅ Campaign `{name}` created.", buttons=get_main_menu())
+        await event.respond("✅ **Ad message saved!**", buttons=back_btn)
 
-    # ------------------------------------------------------------------
-    # Account login — Step 1: phone → request OTP
-    # ------------------------------------------------------------------
-    elif action == "await_account_phone":
+    # ---- Set Interval ----
+    elif action == "await_interval":
+        try:
+            secs = int(text)
+            if not 30 <= secs <= 3600:
+                raise ValueError
+        except ValueError:
+            await event.respond("❌ Enter a number between **30** and **3600**."); return
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE user_settings SET cycle_interval=$1 WHERE user_id=$2", secs, uid
+            )
+        await event.respond(f"✅ Interval set to **{_fmt_interval(secs)}**", buttons=back_btn)
+
+    # ---- Set Cycles ----
+    elif action == "await_cycles":
+        try:
+            n = int(text)
+            if not 1 <= n <= 100:
+                raise ValueError
+        except ValueError:
+            await event.respond("❌ Enter a number between **1** and **100**."); return
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE user_settings SET max_cycles=$1 WHERE user_id=$2", n, uid
+            )
+        await event.respond(f"✅ Cycles set to **{n}**", buttons=back_btn)
+
+    # ---- Exclude: add ----
+    elif action == "await_add_excl":
+        if "|" not in text:
+            await event.respond("❌ Use format: `<chat_id> | <Title>`"); return
+        cid, title = [p.strip() for p in text.split("|", 1)]
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO excluded_groups(chat_id,title,owner_id) VALUES($1,$2,$3)
+                ON CONFLICT(owner_id,chat_id) DO UPDATE SET title=EXCLUDED.title
+            """, cid, title, uid)
+        await event.respond(f"✅ `{title}` excluded.", buttons=back_btn)
+
+    # ---- Exclude: remove ----
+    elif action == "await_rm_excl":
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM excluded_groups WHERE chat_id=$1 AND owner_id=$2", text, uid
+            )
+        await event.respond(f"✅ `{text}` removed.", buttons=back_btn)
+
+    # ---- Auto Join Groups ----
+    elif action == "await_autojoin":
+        links = [l.strip() for l in text.split("\n") if l.strip()]
+        if not links:
+            await event.respond("❌ No links provided."); return
+
+        async with db_pool.acquire() as conn:
+            acct = await conn.fetchrow(
+                "SELECT session_name FROM accounts WHERE owner_id=$1 AND is_active=TRUE LIMIT 1", uid
+            )
+        if not acct:
+            await event.respond("❌ Add an account first!"); return
+
+        sess = acct["session_name"]
+        uc = TelegramClient(os.path.join(DATA_DIR, sess), API_ID, API_HASH)
+        await uc.connect()
+        if not await uc.is_user_authorized():
+            await uc.disconnect()
+            await event.respond("❌ Account session expired. Re-add the account."); return
+
+        joined, failed = 0, 0
+        status_msg = await event.respond("📦 **Joining…** 0 joined / 0 failed")
+
+        for link in links:
+            try:
+                raw = link.replace("https://t.me/", "").replace("http://t.me/", "").replace("@", "").strip("/")
+                if raw.startswith("+"):
+                    await uc(ImportChatInviteRequest(raw.lstrip("+")))
+                else:
+                    await uc(JoinChannelRequest(raw))
+
+                # resolve entity for ID & title
+                entity = await uc.get_entity(raw if not raw.startswith("+") else link)
+                eid   = str(entity.id)
+                title = getattr(entity, "title", raw)
+
+                async with db_pool.acquire() as conn:
+                    await conn.execute("""
+                        INSERT INTO targets(chat_id,title,owner_id) VALUES($1,$2,$3)
+                        ON CONFLICT(owner_id,chat_id) DO UPDATE SET title=EXCLUDED.title
+                    """, eid, title, uid)
+                joined += 1
+                await asyncio.sleep(random.uniform(3, 6))
+            except FloodWaitError as e:
+                logger.warning(f"FloodWait {e.seconds}s during auto-join")
+                await asyncio.sleep(e.seconds)
+                failed += 1
+            except Exception as e:
+                logger.warning(f"Auto-join failed for {link}: {e}")
+                failed += 1
+            # live progress
+            try:
+                await status_msg.edit(f"📦 **Joining…** {joined} joined / {failed} failed")
+            except Exception:
+                pass
+
+        await uc.disconnect()
+        await status_msg.edit(
+            f"📦 **Auto Join Complete**\n\n"
+            f"✅ Joined & added: **{joined}**\n"
+            f"❌ Failed: **{failed}**",
+            buttons=back_btn,
+        )
+
+    # ==================================================================
+    # Account login — Step 1: phone → send OTP
+    # ==================================================================
+    elif action == "await_phone":
         phone = text
         if not phone.startswith("+") or not phone[1:].isdigit():
-            await event.respond("❌ Use international format e.g. `+919876543210`")
-            return
-        session_name = phone.lstrip("+").replace(" ", "")
-        client = TelegramClient(os.path.join(DATA_DIR, session_name), API_ID, API_HASH)
+            await event.respond("❌ Use international format, e.g. `+919876543210`"); return
+        sess = phone.lstrip("+").replace(" ", "")
+        client = TelegramClient(os.path.join(DATA_DIR, sess), API_ID, API_HASH)
         await client.connect()
         try:
             result = await client.send_code_request(phone)
         except Exception as e:
             await client.disconnect()
-            await event.respond(f"❌ Failed to send OTP: `{e}`")
-            return
-        user_states[user_id] = {
-            "action": "await_account_otp",
+            await event.respond(f"❌ Failed to send OTP: `{e}`"); return
+        user_states[uid] = {
+            "action": "await_otp",
             "phone": phone,
-            "session_name": session_name,
+            "session_name": sess,
             "client": client,
             "phone_code_hash": result.phone_code_hash,
         }
@@ -504,70 +767,68 @@ async def conversational_text_handler(event):
             "Send the **verification code**:\nExample: `12345`"
         )
 
-    # ------------------------------------------------------------------
-    # Account login — Step 2: OTP → sign in
-    # ------------------------------------------------------------------
-    elif action == "await_account_otp":
-        client: TelegramClient = state["client"]
-        phone = state["phone"]
-        session_name = state["session_name"]
-        code = text.replace(" ", "")
+    # ==================================================================
+    # Account login — Step 2: OTP
+    # ==================================================================
+    elif action == "await_otp":
+        client = state["client"]
+        phone  = state["phone"]
+        sess   = state["session_name"]
+        code   = text.replace(" ", "")
         try:
             await client.sign_in(phone=phone, code=code, phone_code_hash=state["phone_code_hash"])
         except SessionPasswordNeededError:
-            user_states[user_id] = {"action": "await_account_2fa", "phone": phone,
-                                    "session_name": session_name, "client": client}
+            user_states[uid] = {
+                "action": "await_2fa", "phone": phone,
+                "session_name": sess, "client": client,
+            }
             await event.respond("🔐 **2FA Required**\n\nSend your **2FA password**:")
             return
         except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
             await client.disconnect()
-            await event.respond(f"❌ Invalid/expired OTP: `{e}`\nStart again from Manage Accounts.")
-            return
+            await event.respond(f"❌ Invalid/expired OTP: `{e}`"); return
         except Exception as e:
             await client.disconnect()
-            await event.respond(f"❌ Login failed: `{e}`")
-            return
-        await _finalize_account_login(event, client, phone, session_name)
+            await event.respond(f"❌ Login failed: `{e}`"); return
+        await _finalize_login(event, client, phone, sess, uid)
 
-    # ------------------------------------------------------------------
-    # Account login — Step 3: 2FA password
-    # ------------------------------------------------------------------
-    elif action == "await_account_2fa":
-        client: TelegramClient = state["client"]
-        phone = state["phone"]
-        session_name = state["session_name"]
+    # ==================================================================
+    # Account login — Step 3: 2FA
+    # ==================================================================
+    elif action == "await_2fa":
+        client = state["client"]
+        phone  = state["phone"]
+        sess   = state["session_name"]
         try:
             await client.sign_in(password=text)
         except Exception as e:
             await client.disconnect()
-            await event.respond(f"❌ 2FA failed: `{e}`")
-            return
-        await _finalize_account_login(event, client, phone, session_name)
+            await event.respond(f"❌ 2FA failed: `{e}`"); return
+        await _finalize_login(event, client, phone, sess, uid)
 
 
-async def _finalize_account_login(event, client: TelegramClient, phone: str, session_name: str) -> None:
+async def _finalize_login(event, client, phone, sess, owner_id):
     me = await client.get_me()
-    bio_text = (
+    bio = (
         f"Ads via @{BOT_USERNAME} Free tier. "
-        f"powered by {FORCE_SUB_CHANNELS[0] if len(FORCE_SUB_CHANNELS) > 0 else '@channel1'} "
+        f"powered by {FORCE_SUB_CHANNELS[0] if FORCE_SUB_CHANNELS else '@channel1'} "
         f"& {FORCE_SUB_CHANNELS[1] if len(FORCE_SUB_CHANNELS) > 1 else '@channel2'}"
     )
     suffix = f" via @{BOT_USERNAME}"
-    current_first = (me.first_name or "").strip()
-    new_first = current_first if suffix.lower() in current_first.lower() else (current_first + suffix)[:64]
-
+    first  = (me.first_name or "").strip()
+    new_first = first if suffix.lower() in first.lower() else (first + suffix)[:64]
     try:
-        await client(UpdateProfileRequest(first_name=new_first, about=bio_text))
-        logger.info(f"Profile updated for {session_name}: name='{new_first}'")
+        await client(UpdateProfileRequest(first_name=new_first, about=bio))
     except Exception as e:
-        logger.warning(f"Could not update profile for {session_name}: {e}")
+        logger.warning(f"Profile update failed for {sess}: {e}")
 
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO accounts (session_name, phone)
-            VALUES ($1,$2)
-            ON CONFLICT (session_name) DO UPDATE SET phone=EXCLUDED.phone, is_active=TRUE
-        """, session_name, phone)
+            INSERT INTO accounts(session_name,phone,owner_id)
+            VALUES($1,$2,$3)
+            ON CONFLICT(session_name) DO UPDATE
+                SET phone=EXCLUDED.phone, is_active=TRUE, owner_id=EXCLUDED.owner_id
+        """, sess, phone, owner_id)
 
     await client.disconnect()
     await event.respond(
@@ -575,132 +836,106 @@ async def _finalize_account_login(event, client: TelegramClient, phone: str, ses
         f"📱 Phone: `{phone}`\n"
         f"👤 Name: `{new_first}`\n"
         f"📝 Bio updated.",
-        buttons=get_main_menu()
+        buttons=[[Button.inline("🔙 Dashboard", b"menu_main")]],
     )
 
 # ---------------------------------------------------------------------------
-# CLI Account Auth Helper
+# /addtarget  — manual target addition
 # ---------------------------------------------------------------------------
 
-async def cli_session_login() -> None:
-    session_name = input("Session name (e.g. main_account): ").strip()
-    phone        = input("Phone number with country code: ").strip()
-    client = TelegramClient(os.path.join(DATA_DIR, session_name), API_ID, API_HASH)
-    await client.start(phone=phone)
-    logger.info(f"Authorized as '{session_name}'!")
+async def addtarget_handler(event):
+    uid  = event.sender_id
+    text = event.text.replace("/addtarget", "").strip()
+    if not text or "|" not in text:
+        await event.respond(
+            "Usage: `/addtarget <chat_id_or_username> | <Title>`\n"
+            "Example: `/addtarget @mygroup | My Group`"
+        )
+        return
+    cid, title = [p.strip() for p in text.split("|", 1)]
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO accounts (session_name, phone) VALUES ($1,$2)
-            ON CONFLICT (session_name) DO UPDATE SET phone=EXCLUDED.phone
-        """, session_name, phone)
-    await client.disconnect()
-    print(f"[+] Session '{session_name}' saved.")
+            INSERT INTO targets(chat_id,title,owner_id) VALUES($1,$2,$3)
+            ON CONFLICT(owner_id,chat_id) DO UPDATE SET title=EXCLUDED.title
+        """, cid, title, uid)
+    await event.respond(f"✅ Target `{title}` added.", buttons=[[Button.inline("🔙 Dashboard", b"menu_main")]])
 
 # ---------------------------------------------------------------------------
-# Application Entry Point
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Lightweight Health Check Server (for Koyeb / Railway / Render)
+# Health-Check Server  (Koyeb / Railway / Render)
 # ---------------------------------------------------------------------------
 
 HEALTH_PORT = int(os.getenv("PORT", "8000"))
 
 async def _health_handler(reader, writer):
-    """Respond to any TCP connection with an HTTP 200 OK (Koyeb health check)."""
-    await reader.read(1024)  # drain the incoming request
-    response = (
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: text/plain\r\n"
-        "Content-Length: 2\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "OK"
+    await reader.read(1024)
+    writer.write(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+        b"Content-Length: 2\r\nConnection: close\r\n\r\nOK"
     )
-    writer.write(response.encode())
     await writer.drain()
     writer.close()
 
 async def start_health_server():
-    server = await asyncio.start_server(_health_handler, "0.0.0.0", HEALTH_PORT)
-    logger.info(f"Health check server listening on port {HEALTH_PORT}")
-    return server
+    srv = await asyncio.start_server(_health_handler, "0.0.0.0", HEALTH_PORT)
+    logger.info(f"Health-check server on port {HEALTH_PORT}")
+    return srv
 
 # ---------------------------------------------------------------------------
-# Application Entry Point
+# Main
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global db_pool, bot_client, campaign_stop_event
+    global db_pool, bot_client
 
-    # --- Validate critical env vars before doing anything ---
     missing = []
     if not API_ID:       missing.append("API_ID")
     if not API_HASH:     missing.append("API_HASH")
     if not BOT_TOKEN:    missing.append("BOT_TOKEN")
     if not DATABASE_URL: missing.append("DATABASE_URL")
     if missing:
-        logger.critical(
-            f"Missing required environment variables: {', '.join(missing)}\n"
-            "Set them in your .env file or in the platform's environment dashboard."
-        )
+        logger.critical(f"Missing env vars: {', '.join(missing)}")
         sys.exit(1)
 
-    campaign_stop_event = asyncio.Event()
-
-    # --- PostgreSQL pool ---
     logger.info("Connecting to PostgreSQL…")
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
-    logger.info("PostgreSQL pool established.")
+    logger.info("PostgreSQL pool ready.")
     await init_db(db_pool)
 
-    if len(sys.argv) > 1 and sys.argv[1] == "--login":
-        await cli_session_login()
-        await db_pool.close()
-        return
+    health = await start_health_server()
 
-    # --- Start health check server (keeps Koyeb from killing the instance) ---
-    health_server = await start_health_server()
-
-    # --- Create bot client (after env validation) using StringSession ---
     bot_client = TelegramClient(StringSession(""), API_ID, API_HASH)
 
-    # --- Register all event handlers ---
-    bot_client.add_event_handler(start_handler,           events.NewMessage(pattern="/start"))
-    bot_client.add_event_handler(verify_sub_handler,      events.CallbackQuery(data=b"verify_sub"))
-    bot_client.add_event_handler(menu_navigation_handler, events.CallbackQuery(pattern=b"menu_.*"))
-    bot_client.add_event_handler(trigger_run_campaign,    events.CallbackQuery(pattern=b"run_camp_.*"))
-    bot_client.add_event_handler(action_trigger,          events.CallbackQuery(pattern=b"act_.*"))
-    bot_client.add_event_handler(conversational_text_handler, events.NewMessage)
+    def _register_handlers(client):
+        client.add_event_handler(start_handler,      events.NewMessage(pattern="/start"))
+        client.add_event_handler(addtarget_handler,  events.NewMessage(pattern="/addtarget"))
+        client.add_event_handler(verify_sub_handler, events.CallbackQuery(data=b"verify_sub"))
+        client.add_event_handler(menu_handler,       events.CallbackQuery(pattern=b"menu_.*"))
+        client.add_event_handler(action_handler,     events.CallbackQuery(pattern=b"act_.*"))
+        client.add_event_handler(del_acct_handler,   events.CallbackQuery(pattern=b"delacc_.*"))
+        # text_handler must be last — it's a catch-all for conversational states
+        client.add_event_handler(text_handler,       events.NewMessage(func=lambda e: not e.text or not e.text.startswith("/")))
 
-    logger.info("Starting Telegram Campaign Control Bot…")
+    _register_handlers(bot_client)
+
+    logger.info("Starting Ads Bot…")
     while True:
         try:
             await bot_client.start(bot_token=BOT_TOKEN)
             break
         except FloodWaitError as e:
-            logger.warning(
-                f"FloodWaitError: Telegram requires a wait of {e.seconds}s "
-                f"(~{e.seconds // 60} min). Sleeping before retry…"
-            )
+            logger.warning(f"FloodWait {e.seconds}s (~{e.seconds//60}min). Sleeping…")
             await asyncio.sleep(e.seconds + 5)
-            # Recreate client with a fresh connection for the retry
             bot_client = TelegramClient(StringSession(""), API_ID, API_HASH)
-            bot_client.add_event_handler(start_handler,           events.NewMessage(pattern="/start"))
-            bot_client.add_event_handler(verify_sub_handler,      events.CallbackQuery(data=b"verify_sub"))
-            bot_client.add_event_handler(menu_navigation_handler, events.CallbackQuery(pattern=b"menu_.*"))
-            bot_client.add_event_handler(trigger_run_campaign,    events.CallbackQuery(pattern=b"run_camp_.*"))
-            bot_client.add_event_handler(action_trigger,          events.CallbackQuery(pattern=b"act_.*"))
-            bot_client.add_event_handler(conversational_text_handler, events.NewMessage)
-    logger.info("Bot is active and listening for events.")
+            _register_handlers(bot_client)
+    logger.info("Bot is live.")
 
     try:
         await bot_client.run_until_disconnected()
     finally:
-        health_server.close()
-        await health_server.wait_closed()
+        health.close()
+        await health.wait_closed()
         await db_pool.close()
-        logger.info("PostgreSQL pool closed.")
+        logger.info("Shutdown complete.")
 
 
 if __name__ == "__main__":

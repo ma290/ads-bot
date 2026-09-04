@@ -27,6 +27,9 @@ services:
     tty: true          # Necessary for OTP/password terminal prompts
     env_file:
       - .env
+    environment:
+      # Override .env's remote DATABASE_URL with the local Postgres container
+      DATABASE_URL: postgresql://campaign_user:campaign_pass@postgres:5432/campaign_db
     volumes:
       - ./data:/app/data
     depends_on:

@@ -252,9 +252,6 @@ async def run_campaign_worker(campaign_id: int) -> None:
 
 async def start_handler(event):
     user_id = event.sender_id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
-        await event.respond("🚫 Unauthorized access.")
-        return
     if not await check_force_sub(user_id):
         await event.respond(
             "⚠️ **Access Required**\n\nJoin all channels to use this bot:",
@@ -276,11 +273,6 @@ async def verify_sub_handler(event):
 
 
 async def menu_navigation_handler(event):
-    user_id = event.sender_id
-    if ADMIN_IDS and user_id not in ADMIN_IDS:
-        await event.answer("Unauthorized", alert=True)
-        return
-
     data = event.data.decode("utf-8")
 
     if data == "menu_status":

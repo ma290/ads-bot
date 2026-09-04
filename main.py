@@ -21,7 +21,7 @@ from telethon.errors import (
 from telethon.tl.functions.channels import GetParticipantRequest, JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.functions.account import UpdateProfileRequest
-from telethon.tl.types import Chat, Channel
+from telethon.tl.types import Chat, Channel, PeerChannel, PeerChat, PeerUser
 
 # ---------------------------------------------------------------------------
 # Environment & Config
@@ -285,9 +285,17 @@ async def ad_worker(user_id: int) -> None:
                 excl_rows = await conn.fetch(
                     "SELECT chat_id FROM excluded_groups WHERE owner_id=$1", user_id
                 )
+            # Normalize excluded IDs to positive integers for reliable matching
             excluded_ids = set()
             for er in excl_rows:
-                excluded_ids.add(er["chat_id"])
+                raw = er["chat_id"].strip()
+                # Strip -100 prefix (supergroups) or - prefix (basic groups)
+                if raw.startswith("-100"):
+                    excluded_ids.add(raw[4:])
+                elif raw.startswith("-"):
+                    excluded_ids.add(raw[1:])
+                else:
+                    excluded_ids.add(raw)
 
             # Fetch ALL groups/supergroups from the user's account dialogs
             all_groups = []
@@ -295,12 +303,10 @@ async def ad_worker(user_id: int) -> None:
                 entity = dialog.entity
                 # Include groups (Chat) and supergroups/channels that are megagroups
                 if isinstance(entity, Chat):
-                    gid = str(entity.id)
-                    if gid not in excluded_ids and f"-{gid}" not in excluded_ids:
+                    if str(entity.id) not in excluded_ids:
                         all_groups.append({"id": entity.id, "title": entity.title})
                 elif isinstance(entity, Channel) and entity.megagroup:
-                    gid = str(entity.id)
-                    if gid not in excluded_ids and f"-100{gid}" not in excluded_ids:
+                    if str(entity.id) not in excluded_ids:
                         all_groups.append({"id": entity.id, "title": entity.title})
 
             logger.info(f"User {user_id}: cycle {cycle}/{max_cyc}, found {len(all_groups)} groups (excl {len(excluded_ids)})")
@@ -570,16 +576,30 @@ async def action_handler(event):
     elif data == "act_add_excl":
         user_states[uid] = {"action": "await_add_excl"}
         await event.respond(
-            "🚫 Send: `<chat_id_or_username> | <Title>`\n"
-            "Example: `@group | My Group`"
+            "➕ **Exclude a Group**\n\n"
+            "Forward a message from the group you want to exclude,\n"
+            "or send its **Chat ID** (e.g., `-100123456789`).\n\n"
+            "↩️ **Back**: /start",
+            buttons=[[Button.inline("🔙 Cancel", b"menu_excl")]],
         )
         await event.answer()
 
-    # ---- Exclude: remove ----
+    # ---- Exclude: remove (button-based) ----
     elif data == "act_rm_excl":
-        user_states[uid] = {"action": "await_rm_excl"}
-        await event.respond("Send the Chat ID to remove from exclusions:")
-        await event.answer()
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id, chat_id, title FROM excluded_groups WHERE owner_id=$1", uid
+            )
+        if not rows:
+            await event.answer("ℹ️ No excluded groups to remove.", alert=True)
+            return
+        btns = []
+        for r in rows[:20]:
+            lbl = f"❌ {r['title'] or r['chat_id']}"
+            btns.append([Button.inline(lbl, f"rmexcl_{r['id']}".encode())])
+        btns.append([Button.inline("🔙 Back", b"menu_excl")])
+        await event.edit("🗑 **Select group to un-exclude:**", buttons=btns)
+        await event.answer() if False else None  # already edited
 
     # ---- Auto Join Groups ----
     elif data == "act_autojoin":
@@ -629,6 +649,48 @@ async def del_acct_handler(event):
         os.remove(path)
     await event.answer(f"✅ {sess} deleted.")
     await _refresh_dashboard(event, uid)
+
+# ---------------------------------------------------------------------------
+# Callback: rmexcl_* — remove a single excluded group
+# ---------------------------------------------------------------------------
+
+async def rm_excl_handler(event):
+    uid = event.sender_id
+    excl_id = event.data.decode().replace("rmexcl_", "", 1)
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT title, chat_id FROM excluded_groups WHERE id=$1 AND owner_id=$2",
+            int(excl_id), uid,
+        )
+        if not row:
+            await event.answer("❌ Not found.", alert=True)
+            return
+        await conn.execute(
+            "DELETE FROM excluded_groups WHERE id=$1 AND owner_id=$2",
+            int(excl_id), uid,
+        )
+    display = row["title"] or row["chat_id"]
+    await event.answer(f"✅ {display} removed from exclusions.")
+    # Refresh the exclude menu
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, chat_id, title FROM excluded_groups WHERE owner_id=$1", uid
+        )
+    if not rows:
+        await event.edit(
+            "🚫 **Excluded Groups**\n\nNo groups excluded.",
+            buttons=[
+                [Button.inline("➕ Add", b"act_add_excl"), Button.inline("🗑 Remove", b"act_rm_excl")],
+                [Button.inline("🔙 Back", b"menu_main")],
+            ],
+        )
+    else:
+        btns = []
+        for r in rows[:20]:
+            lbl = f"❌ {r['title'] or r['chat_id']}"
+            btns.append([Button.inline(lbl, f"rmexcl_{r['id']}".encode())])
+        btns.append([Button.inline("🔙 Back", b"menu_excl")])
+        await event.edit("🗑 **Select group to un-exclude:**", buttons=btns)
 
 # ---------------------------------------------------------------------------
 # Text handler — conversational state machine
@@ -683,25 +745,71 @@ async def text_handler(event):
             )
         await event.respond(f"✅ Cycles set to **{n}**", buttons=back_btn)
 
-    # ---- Exclude: add ----
+    # ---- Exclude: add (forwarded message or plain chat ID) ----
     elif action == "await_add_excl":
-        if "|" not in text:
-            await event.respond("❌ Use format: `<chat_id> | <Title>`"); return
-        cid, title = [p.strip() for p in text.split("|", 1)]
+        chat_id = None
+        title = None
+
+        # Option A: user forwarded a message from a group
+        if event.message.fwd_from and event.message.fwd_from.from_id:
+            fwd_peer = event.message.fwd_from.from_id
+            if isinstance(fwd_peer, PeerChannel):
+                chat_id = str(fwd_peer.channel_id)
+                try:
+                    entity = await bot_client.get_entity(fwd_peer.channel_id)
+                    title = getattr(entity, "title", None)
+                except Exception:
+                    pass
+            elif isinstance(fwd_peer, PeerChat):
+                chat_id = str(fwd_peer.chat_id)
+                try:
+                    entity = await bot_client.get_entity(fwd_peer.chat_id)
+                    title = getattr(entity, "title", None)
+                except Exception:
+                    pass
+            else:
+                await event.respond(
+                    "❌ That message is from a user, not a group.\n"
+                    "Forward a message from a **group** or send the **Chat ID**."
+                )
+                user_states[uid] = {"action": "await_add_excl"}
+                return
+        # Option B: plain text — treat as a Chat ID
+        else:
+            raw = text.strip()
+            if not raw:
+                await event.respond("❌ Send a Chat ID or forward a message.")
+                user_states[uid] = {"action": "await_add_excl"}
+                return
+            chat_id = raw
+            # Try to resolve title via the user's account
+            try:
+                async with db_pool.acquire() as conn:
+                    acct = await conn.fetchrow(
+                        "SELECT session_name FROM accounts WHERE owner_id=$1 AND is_active=TRUE LIMIT 1", uid
+                    )
+                if acct:
+                    uc = TelegramClient(os.path.join(DATA_DIR, acct["session_name"]), API_ID, API_HASH)
+                    await uc.connect()
+                    if await uc.is_user_authorized():
+                        entity = await uc.get_entity(int(raw))
+                        title = getattr(entity, "title", None)
+                    await uc.disconnect()
+            except Exception:
+                pass
+
+        if not chat_id:
+            await event.respond("❌ Could not detect group. Try sending the Chat ID directly.")
+            user_states[uid] = {"action": "await_add_excl"}
+            return
+
         async with db_pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO excluded_groups(chat_id,title,owner_id) VALUES($1,$2,$3)
                 ON CONFLICT(owner_id,chat_id) DO UPDATE SET title=EXCLUDED.title
-            """, cid, title, uid)
-        await event.respond(f"✅ `{title}` excluded.", buttons=back_btn)
-
-    # ---- Exclude: remove ----
-    elif action == "await_rm_excl":
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM excluded_groups WHERE chat_id=$1 AND owner_id=$2", text, uid
-            )
-        await event.respond(f"✅ `{text}` removed.", buttons=back_btn)
+            """, chat_id, title or "Unknown", uid)
+        display = title or chat_id
+        await event.respond(f"✅ Group **{display}** excluded.", buttons=back_btn)
 
     # ---- Auto Join Groups ----
     elif action == "await_autojoin":
@@ -791,7 +899,9 @@ async def text_handler(event):
         }
         await event.respond(
             "📨 OTP sent to your Telegram app!\n\n"
-            "Send the **verification code**:\nExample: `12345`"
+            "⚠️ **IMPORTANT:** To avoid Telegram blocking, "
+            "add **CZ** before the code.\n\n"
+            "📌 Example: If code is `46162`, type: `CZ46162`"
         )
 
     # ==================================================================
@@ -801,7 +911,10 @@ async def text_handler(event):
         client = state["client"]
         phone  = state["phone"]
         sess   = state["session_name"]
+        # Strip CZ/cz prefix users add to avoid Telegram auto-detection
         code   = text.replace(" ", "")
+        if code.upper().startswith("CZ"):
+            code = code[2:]
         try:
             await client.sign_in(phone=phone, code=code, phone_code_hash=state["phone_code_hash"])
         except SessionPasswordNeededError:
@@ -939,6 +1052,7 @@ async def main() -> None:
         client.add_event_handler(menu_handler,       events.CallbackQuery(pattern=b"menu_.*"))
         client.add_event_handler(action_handler,     events.CallbackQuery(pattern=b"act_.*"))
         client.add_event_handler(del_acct_handler,   events.CallbackQuery(pattern=b"delacc_.*"))
+        client.add_event_handler(rm_excl_handler,    events.CallbackQuery(pattern=b"rmexcl_.*"))
         # text_handler must be last — it's a catch-all for conversational states
         client.add_event_handler(text_handler,       events.NewMessage(func=lambda e: not e.text or not e.text.startswith("/")))
 

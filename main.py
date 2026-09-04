@@ -49,8 +49,10 @@ MAX_DELAY    = int(os.getenv("MAX_DELAY", "40"))
 # Free vs Premium limits
 FREE_MAX_ACCOUNTS    = int(os.getenv("FREE_MAX_ACCOUNTS", "3"))
 PREMIUM_MAX_ACCOUNTS = int(os.getenv("PREMIUM_MAX_ACCOUNTS", "20"))
-FREE_MAX_CYCLES      = int(os.getenv("FREE_MAX_CYCLES", "5"))
+FREE_MAX_CYCLES      = int(os.getenv("FREE_MAX_CYCLES", "20"))
 PREMIUM_MAX_CYCLES   = int(os.getenv("PREMIUM_MAX_CYCLES", "100"))
+# Auto-reply: free users capped per ad run; premium = unlimited
+FREE_MAX_AI_REPLIES  = int(os.getenv("FREE_MAX_AI_REPLIES", "20"))
 
 DATA_DIR = os.path.abspath("data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -108,7 +110,7 @@ async def init_db(pool: asyncpg.Pool) -> None:
                 ad_message     TEXT,
                 cycle_interval INTEGER NOT NULL DEFAULT 180,
                 target_type    TEXT    NOT NULL DEFAULT 'groups',
-                max_cycles     INTEGER NOT NULL DEFAULT 5,
+                max_cycles     INTEGER NOT NULL DEFAULT 20,
                 current_cycle  INTEGER NOT NULL DEFAULT 0,
                 status         TEXT    NOT NULL DEFAULT 'paused',
                 ai_reply       BOOLEAN NOT NULL DEFAULT FALSE,
@@ -520,7 +522,9 @@ async def ad_worker(user_id: int) -> None:
     ad_msg   = settings["ad_message"]
     max_cyc  = min(int(settings["max_cycles"]), max_cycles_for(settings))
     interval = settings["cycle_interval"]  # delay between full cycles
-    ai_reply = settings.get("ai_reply", False) and is_premium_user(settings)
+    ai_reply_on = bool(settings.get("ai_reply", False))
+    premium = is_premium_user(settings)
+    ai_reply_cap = None if premium else FREE_MAX_AI_REPLIES  # None = unlimited
 
     if not ad_msg:
         logger.error(f"User {user_id}: no ad message."); return
@@ -636,7 +640,8 @@ async def ad_worker(user_id: int) -> None:
 
                 if ok:
                     successful += 1
-                    if ai_reply:
+                    # Auto-reply: free = capped per run, premium = unlimited
+                    if ai_reply_on and (ai_reply_cap is None or auto_replied < ai_reply_cap):
                         auto_replied += 1  # placeholder until AI reply worker wires in
                 else:
                     failed += 1
@@ -814,14 +819,14 @@ async def menu_handler(event):
                 "⭐ **You are Premium!**\n\n"
                 f"• Accounts: up to **{PREMIUM_MAX_ACCOUNTS}**\n"
                 f"• Cycles: up to **{PREMIUM_MAX_CYCLES}**\n"
-                "• AI auto-reply unlocked\n"
+                "• AI auto-reply: **unlimited**\n"
             )
         else:
             txt = (
                 "⭐ **Premium Features**\n\n"
                 f"• Accounts: **{FREE_MAX_ACCOUNTS}** → **{PREMIUM_MAX_ACCOUNTS}**\n"
                 f"• Cycles: **{FREE_MAX_CYCLES}** → **{PREMIUM_MAX_CYCLES}**\n"
-                "• AI auto-reply\n"
+                f"• AI auto-reply: **{FREE_MAX_AI_REPLIES}/run** → **unlimited**\n"
                 "• Priority support\n\n"
                 "Premium lene ke liye admin se contact karo: **@mrvoidance**"
             )
@@ -897,7 +902,8 @@ async def action_handler(event):
         await event.respond(
             "🔄 **Set Cycles**\n\n"
             "How many times to loop through all targets?\n"
-            f"Example: `5`\n\n"
+            "(1 cycle = saare groups pe 1 full round)\n"
+            f"Example: `10`\n\n"
             f"Min: `1` · Max: `{cap}`"
             + ("" if is_premium_user(s) else " _(Premium pe zyada)_")
         )
@@ -936,13 +942,16 @@ async def action_handler(event):
     # ---- Toggle AI Reply ----
     elif data == "act_tgl_ai":
         s = await get_settings(uid)
-        if not is_premium_user(s):
-            await event.answer("❌ AI Reply sirf Premium pe available hai. Go Premium ⭐", alert=True)
-            return
         new_val = not s["ai_reply"]
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE user_settings SET ai_reply=$1 WHERE user_id=$2", new_val, uid)
-        await event.answer(f"AI Reply: {'ON' if new_val else 'OFF'}")
+        if new_val and not is_premium_user(s):
+            await event.answer(
+                f"AI Reply: ON (free limit {FREE_MAX_AI_REPLIES}/run — Premium = unlimited)",
+                alert=True,
+            )
+        else:
+            await event.answer(f"AI Reply: {'ON' if new_val else 'OFF'}")
         await _refresh_dashboard(event, uid)
 
     # ---- Exclude: add ----
@@ -1424,7 +1433,7 @@ async def premium_admin_handler(event):
                 target_id,
                 "⭐ **Premium activated!**\n\n"
                 f"Ab tak accounts: **{PREMIUM_MAX_ACCOUNTS}**, "
-                f"cycles: **{PREMIUM_MAX_CYCLES}**, AI reply unlocked.\n"
+                f"cycles: **{PREMIUM_MAX_CYCLES}**, AI reply **unlimited**.\n"
                 "Dashboard refresh: /start",
             )
         except Exception as e:

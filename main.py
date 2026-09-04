@@ -608,6 +608,36 @@ async def cli_session_login() -> None:
 # Application Entry Point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Lightweight Health Check Server (for Koyeb / Railway / Render)
+# ---------------------------------------------------------------------------
+
+HEALTH_PORT = int(os.getenv("PORT", "8000"))
+
+async def _health_handler(reader, writer):
+    """Respond to any TCP connection with an HTTP 200 OK (Koyeb health check)."""
+    await reader.read(1024)  # drain the incoming request
+    response = (
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 2\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "OK"
+    )
+    writer.write(response.encode())
+    await writer.drain()
+    writer.close()
+
+async def start_health_server():
+    server = await asyncio.start_server(_health_handler, "0.0.0.0", HEALTH_PORT)
+    logger.info(f"Health check server listening on port {HEALTH_PORT}")
+    return server
+
+# ---------------------------------------------------------------------------
+# Application Entry Point
+# ---------------------------------------------------------------------------
+
 async def main() -> None:
     global db_pool, bot_client, campaign_stop_event
 
@@ -637,9 +667,10 @@ async def main() -> None:
         await db_pool.close()
         return
 
-    # --- Create bot client HERE (after env validation) using StringSession ---
-    # StringSession("") = in-memory session, re-authenticates via bot_token each start.
-    # This makes the bot fully stateless — no local session files needed.
+    # --- Start health check server (keeps Koyeb from killing the instance) ---
+    health_server = await start_health_server()
+
+    # --- Create bot client (after env validation) using StringSession ---
     bot_client = TelegramClient(StringSession(""), API_ID, API_HASH)
 
     # --- Register all event handlers ---
@@ -657,6 +688,8 @@ async def main() -> None:
     try:
         await bot_client.run_until_disconnected()
     finally:
+        health_server.close()
+        await health_server.wait_closed()
         await db_pool.close()
         logger.info("PostgreSQL pool closed.")
 

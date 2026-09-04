@@ -36,10 +36,21 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 LOGGER_BOT_TOKEN    = os.getenv("LOGGER_BOT_TOKEN", "")
 LOGGER_BOT_USERNAME = os.getenv("LOGGER_BOT_USERNAME", "").lstrip("@")
 FORCE_SUB_CHANNELS = [x.strip() for x in os.getenv("FORCE_SUB_CHANNELS", "").split(",") if x.strip()]
+ADMIN_USER_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_USER_IDS", "").split(",")
+    if x.strip().isdigit()
+}
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 MAX_RETRIES  = int(os.getenv("MAX_RETRIES", "3"))
 MIN_DELAY    = int(os.getenv("MIN_DELAY", "15"))
 MAX_DELAY    = int(os.getenv("MAX_DELAY", "40"))
+
+# Free vs Premium limits
+FREE_MAX_ACCOUNTS    = int(os.getenv("FREE_MAX_ACCOUNTS", "3"))
+PREMIUM_MAX_ACCOUNTS = int(os.getenv("PREMIUM_MAX_ACCOUNTS", "20"))
+FREE_MAX_CYCLES      = int(os.getenv("FREE_MAX_CYCLES", "5"))
+PREMIUM_MAX_CYCLES   = int(os.getenv("PREMIUM_MAX_CYCLES", "100"))
 
 DATA_DIR = os.path.abspath("data")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -100,7 +111,8 @@ async def init_db(pool: asyncpg.Pool) -> None:
                 max_cycles     INTEGER NOT NULL DEFAULT 5,
                 current_cycle  INTEGER NOT NULL DEFAULT 0,
                 status         TEXT    NOT NULL DEFAULT 'paused',
-                ai_reply       BOOLEAN NOT NULL DEFAULT FALSE
+                ai_reply       BOOLEAN NOT NULL DEFAULT FALSE,
+                is_premium     BOOLEAN NOT NULL DEFAULT FALSE
             )
         """)
         await conn.execute("""
@@ -140,7 +152,29 @@ async def init_db(pool: asyncpg.Pool) -> None:
                 EXCEPTION WHEN others THEN NULL;
                 END $$;
             """)
+        await conn.execute("""
+            DO $$ BEGIN
+                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS is_premium BOOLEAN NOT NULL DEFAULT FALSE;
+            EXCEPTION WHEN others THEN NULL;
+            END $$;
+        """)
     logger.info("Database tables verified / created.")
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_USER_IDS
+
+
+def is_premium_user(settings: dict) -> bool:
+    return bool(settings.get("is_premium"))
+
+
+def max_accounts_for(settings: dict) -> int:
+    return PREMIUM_MAX_ACCOUNTS if is_premium_user(settings) else FREE_MAX_ACCOUNTS
+
+
+def max_cycles_for(settings: dict) -> int:
+    return PREMIUM_MAX_CYCLES if is_premium_user(settings) else FREE_MAX_CYCLES
 
 
 async def get_settings(user_id: int) -> dict:
@@ -157,7 +191,10 @@ async def get_settings(user_id: int) -> dict:
             row = await conn.fetchrow(
                 "SELECT * FROM user_settings WHERE user_id = $1", user_id
             )
-    return dict(row)
+    data = dict(row)
+    # Older DBs may lack the column until migration; default safely
+    data.setdefault("is_premium", False)
+    return data
 
 # ---------------------------------------------------------------------------
 # Force-Subscription Helpers
@@ -207,15 +244,17 @@ def dashboard_text(settings: dict, acct_count: int) -> str:
     }
     status = status_map.get(settings["status"], settings["status"])
     interval_str = _fmt_interval(settings["cycle_interval"])
+    plan = "premium ⭐" if is_premium_user(settings) else "free"
+    acct_cap = max_accounts_for(settings)
 
     return (
         f"━━━━━ **Powered by @mrvoidance** ━━━━━\n"
         f"━━━━\n\n\n"
-        f"• **Hosted Accounts:** __{acct_count}/20__\n"
+        f"• **Hosted Accounts:** __{acct_count}/{acct_cap}__\n"
         f"• **Service:** __{svc}__\n"
         f"• **Advertisement status:** __{status}__\n"
         f"• **Interval:** __{interval_str}__\n"
-        f"• **Current plan:** __free__\n\n"
+        f"• **Current plan:** __{plan}__\n\n"
         f"> Developed and managed by: \"\"\n"
         f"> **@mrvoidance**"
     )
@@ -226,13 +265,14 @@ def main_menu(settings: dict):
     if is_running:
         run_btn = Button.inline("Stop Ads ⏸", b"act_stop")
     else:
-        run_btn = Button.inline("Run Ads ▶", b"act_start")
+        run_btn = Button.inline("Start Ads ▶", b"act_start")
     return [
-        [Button.inline("Add account", b"act_add_acct")],
+        [Button.inline("Add account", b"act_add_acct"), Button.inline("🗑 Delete Account", b"act_del_accts")],
         [Button.inline("Set Advertisement", b"act_set_ad"), Button.inline("Interval & delay", b"menu_interval")],
         [run_btn],
         [Button.inline("Exclude Groups 🚫", b"menu_excl"), Button.inline("Auto join", b"act_autojoin")],
-        [Button.inline("Auto reply", b"act_tgl_ai"), Button.inline("Go Premium", b"menu_premium")],
+        [Button.inline("Auto reply", b"act_tgl_ai"), Button.inline("My Accounts", b"menu_accts")],
+        [Button.inline("Go Premium ⭐", b"menu_premium")],
         [Button.url("About bot ↗", f"https://t.me/{BOT_USERNAME}"), Button.url("Powered by ↗", "https://t.me/mrvoidance")],
     ]
 
@@ -328,17 +368,145 @@ async def push_logger_alert(user_id: int, text: str) -> None:
 
 
 async def logger_start_handler(event):
-    """ /start on the Logger Bot — user must open it once so we can DM them. """
+    """ /start on the Logger Bot — menu + enable DMs for live stats. """
+    uid = event.sender_id
+    settings = await get_settings(uid)
     await event.respond(
+        _logger_home_text(settings),
+        buttons=_logger_menu(settings),
+    )
+
+
+def _logger_home_text(settings: dict) -> str:
+    status = settings.get("status", "paused")
+    return (
         "📊 **Logger Bot**\n\n"
-        "Yahan aapko live ad stats milenge:\n"
+        "Live ad stats yahan aate hain:\n"
         "• Kitne ads run hue\n"
-        "• Kitne **successful** ✅\n"
-        "• Kitne **failed** ❌\n"
-        "• Flood wait / auto-reply counts\n\n"
-        "Main Ads Bot se **Run Ads** dabao — logs yahan aayenge.\n"
+        "• Kitne **successful** ✅ / **failed** ❌\n"
+        "• Flood wait / auto-reply\n\n"
+        f"Advertisement status: **{status}**\n"
         f"{'Ads bot: @' + BOT_USERNAME if BOT_USERNAME else ''}"
     )
+
+
+def _logger_menu(settings: dict):
+    is_running = settings.get("status") == "running"
+    run_btn = (
+        Button.inline("Stop Ads ⏸", b"log_stop")
+        if is_running
+        else Button.inline("Start Ads ▶", b"log_start")
+    )
+    return [
+        [run_btn],
+        [Button.inline("🗑 Delete Account", b"log_del_accts")],
+        [Button.inline("🔄 Refresh", b"log_home")],
+    ]
+
+
+async def _start_ads_for_user(uid: int) -> tuple[bool, str]:
+    """Shared start logic. Returns (ok, message)."""
+    if uid in active_tasks and not active_tasks[uid].done():
+        return False, "⚠️ Ads already running!"
+    s = await get_settings(uid)
+    if not s["ad_message"]:
+        return False, "❌ Set an ad message first (on Ads Bot)!"
+    async with db_pool.acquire() as conn:
+        ac = await conn.fetchval(
+            "SELECT COUNT(*) FROM accounts WHERE owner_id=$1 AND is_active=TRUE", uid
+        )
+    if ac == 0:
+        return False, "❌ Add an account first (on Ads Bot)!"
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE user_settings SET status='running', current_cycle=0 WHERE user_id=$1",
+            uid,
+        )
+    stop_events[uid] = asyncio.Event()
+    active_tasks[uid] = asyncio.create_task(ad_worker(uid))
+    return True, "▶️ Ads started! Live logs yahan update honge."
+
+
+async def _stop_ads_for_user(uid: int) -> tuple[bool, str]:
+    if uid in active_tasks and not active_tasks[uid].done():
+        stop_events[uid].set()
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE user_settings SET status='paused' WHERE user_id=$1", uid
+            )
+        return True, "⏸ Stopping ads…"
+    return False, "ℹ️ No ads running."
+
+
+async def logger_callback_handler(event):
+    """Inline buttons on the Logger Bot."""
+    uid = event.sender_id
+    data = event.data.decode()
+
+    if data == "log_home":
+        settings = await get_settings(uid)
+        await event.edit(_logger_home_text(settings), buttons=_logger_menu(settings))
+        await event.answer()
+
+    elif data == "log_start":
+        ok, msg = await _start_ads_for_user(uid)
+        await event.answer(msg, alert=not ok)
+        settings = await get_settings(uid)
+        try:
+            await event.edit(_logger_home_text(settings), buttons=_logger_menu(settings))
+        except Exception:
+            pass
+        if ok:
+            await event.respond(msg)
+
+    elif data == "log_stop":
+        ok, msg = await _stop_ads_for_user(uid)
+        await event.answer(msg, alert=not ok)
+        settings = await get_settings(uid)
+        try:
+            await event.edit(_logger_home_text(settings), buttons=_logger_menu(settings))
+        except Exception:
+            pass
+
+    elif data == "log_del_accts":
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT session_name, phone FROM accounts WHERE owner_id=$1", uid
+            )
+        if not rows:
+            await event.answer("ℹ️ No accounts to delete.", alert=True)
+            return
+        btns = []
+        for r in rows:
+            lbl = f"🗑 {r['phone'] or r['session_name']}"
+            btns.append([Button.inline(lbl, f"logdel_{r['session_name']}".encode())])
+        btns.append([Button.inline("🔙 Back", b"log_home")])
+        await event.edit("🗑 **Select account to delete:**", buttons=btns)
+        await event.answer()
+
+    elif data.startswith("logdel_"):
+        sess = data.replace("logdel_", "", 1)
+        async with db_pool.acquire() as conn:
+            ok = await conn.fetchval(
+                "SELECT 1 FROM accounts WHERE session_name=$1 AND owner_id=$2",
+                sess, uid,
+            )
+            if not ok:
+                await event.answer("❌ Not found.", alert=True)
+                return
+            await conn.execute(
+                "DELETE FROM accounts WHERE session_name=$1 AND owner_id=$2",
+                sess, uid,
+            )
+        path = os.path.join(DATA_DIR, sess + ".session")
+        if os.path.exists(path):
+            os.remove(path)
+        await event.answer(f"✅ {sess} deleted.")
+        settings = await get_settings(uid)
+        await event.edit(
+            f"✅ Account `{sess}` deleted.\n\n" + _logger_home_text(settings),
+            buttons=_logger_menu(settings),
+        )
 
 # ---------------------------------------------------------------------------
 # Ad Dispatch Worker  (one per user)
@@ -350,9 +518,9 @@ async def ad_worker(user_id: int) -> None:
 
     settings = await get_settings(user_id)
     ad_msg   = settings["ad_message"]
-    max_cyc  = settings["max_cycles"]
+    max_cyc  = min(int(settings["max_cycles"]), max_cycles_for(settings))
     interval = settings["cycle_interval"]  # delay between full cycles
-    ai_reply = settings.get("ai_reply", False)
+    ai_reply = settings.get("ai_reply", False) and is_premium_user(settings)
 
     if not ad_msg:
         logger.error(f"User {user_id}: no ad message."); return
@@ -640,15 +808,24 @@ async def menu_handler(event):
 
     # ---- Premium ----
     elif data == "menu_premium":
-        await event.edit(
-            "⭐ **Premium Features**\n\n"
-            "• Unlimited accounts (20+)\n"
-            "• Unlimited cycles\n"
-            "• AI auto-reply\n"
-            "• Priority support\n\n"
-            "Contact admin for premium access.",
-            buttons=[[Button.inline("🔙 Back", b"menu_main")]],
-        )
+        settings = await get_settings(uid)
+        if is_premium_user(settings):
+            txt = (
+                "⭐ **You are Premium!**\n\n"
+                f"• Accounts: up to **{PREMIUM_MAX_ACCOUNTS}**\n"
+                f"• Cycles: up to **{PREMIUM_MAX_CYCLES}**\n"
+                "• AI auto-reply unlocked\n"
+            )
+        else:
+            txt = (
+                "⭐ **Premium Features**\n\n"
+                f"• Accounts: **{FREE_MAX_ACCOUNTS}** → **{PREMIUM_MAX_ACCOUNTS}**\n"
+                f"• Cycles: **{FREE_MAX_CYCLES}** → **{PREMIUM_MAX_CYCLES}**\n"
+                "• AI auto-reply\n"
+                "• Priority support\n\n"
+                "Premium lene ke liye admin se contact karo: **@mrvoidance**"
+            )
+        await event.edit(txt, buttons=[[Button.inline("🔙 Back", b"menu_main")]])
 
 # ---------------------------------------------------------------------------
 # Callback: act_* actions
@@ -660,6 +837,19 @@ async def action_handler(event):
 
     # ---- Add Account ----
     if data == "act_add_acct":
+        settings = await get_settings(uid)
+        cap = max_accounts_for(settings)
+        async with db_pool.acquire() as conn:
+            cnt = await conn.fetchval(
+                "SELECT COUNT(*) FROM accounts WHERE owner_id=$1", uid
+            )
+        if cnt >= cap:
+            await event.answer(
+                f"❌ Limit reached ({cnt}/{cap}). "
+                + ("Premium upgrade chahiye." if not is_premium_user(settings) else "Max accounts ho gaye."),
+                alert=True,
+            )
+            return
         user_states[uid] = {"action": "await_phone"}
         await event.respond(
             "📱 **Add Telegram Account**\n\n"
@@ -701,58 +891,54 @@ async def action_handler(event):
 
     # ---- Set Cycles ----
     elif data == "act_set_cyc":
+        s = await get_settings(uid)
+        cap = max_cycles_for(s)
         user_states[uid] = {"action": "await_cycles"}
         await event.respond(
             "🔄 **Set Cycles**\n\n"
             "How many times to loop through all targets?\n"
-            "Example: `5`\n\n"
-            "Min: `1` · Max: `100`"
+            f"Example: `5`\n\n"
+            f"Min: `1` · Max: `{cap}`"
+            + ("" if is_premium_user(s) else " _(Premium pe zyada)_")
         )
         await event.answer()
 
     # ---- Start Ads ----
     elif data == "act_start":
-        if uid in active_tasks and not active_tasks[uid].done():
-            await event.answer("⚠️ Ads already running!", alert=True)
-            return
-        s = await get_settings(uid)
-        if not s["ad_message"]:
-            await event.answer("❌ Set an ad message first!", alert=True); return
-        async with db_pool.acquire() as conn:
-            ac = await conn.fetchval("SELECT COUNT(*) FROM accounts WHERE owner_id=$1 AND is_active=TRUE", uid)
-        if ac == 0:
-            await event.answer("❌ Add an account first!", alert=True); return
-
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE user_settings SET status='running', current_cycle=0 WHERE user_id=$1", uid
-            )
-        stop_events[uid] = asyncio.Event()
-        active_tasks[uid] = asyncio.create_task(ad_worker(uid))
-        await event.answer("▶️ Ads started!")
-        await _refresh_dashboard(event, uid)
-        # Remind user to open Logger Bot so they receive live stats
-        if LOGGER_BOT_USERNAME:
-            await event.respond(
-                "📊 **Live logs** Logger Bot pe aayenge.\n\n"
-                f"Pehle ek baar open karo: https://t.me/{LOGGER_BOT_USERNAME}\n"
-                "Aur **/start** dabao — phir stats milenge."
-            )
+        ok, msg = await _start_ads_for_user(uid)
+        await event.answer(msg, alert=not ok)
+        if ok:
+            await _refresh_dashboard(event, uid)
+            if LOGGER_BOT_USERNAME:
+                await event.respond(
+                    "▶️ **Ads started!**\n\n"
+                    "Live logs dekhne ke liye Logger Bot kholo 👇",
+                    buttons=[[
+                        Button.url(
+                            "📊 Open Logger Bot",
+                            f"https://t.me/{LOGGER_BOT_USERNAME}?start=logs",
+                        )
+                    ]],
+                )
+            else:
+                await event.respond(
+                    "▶️ Ads started!\n\n"
+                    "⚠️ LOGGER_BOT_USERNAME set nahi hai — logs ke liye logger bot configure karo."
+                )
 
     # ---- Stop Ads ----
     elif data == "act_stop":
-        if uid in active_tasks and not active_tasks[uid].done():
-            stop_events[uid].set()
-            async with db_pool.acquire() as conn:
-                await conn.execute("UPDATE user_settings SET status='paused' WHERE user_id=$1", uid)
-            await event.answer("⏸ Stopping ads…")
+        ok, msg = await _stop_ads_for_user(uid)
+        await event.answer(msg, alert=not ok)
+        if ok:
             await _refresh_dashboard(event, uid)
-        else:
-            await event.answer("ℹ️ No ads running.", alert=True)
 
     # ---- Toggle AI Reply ----
     elif data == "act_tgl_ai":
         s = await get_settings(uid)
+        if not is_premium_user(s):
+            await event.answer("❌ AI Reply sirf Premium pe available hai. Go Premium ⭐", alert=True)
+            return
         new_val = not s["ai_reply"]
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE user_settings SET ai_reply=$1 WHERE user_id=$2", new_val, uid)
@@ -920,12 +1106,18 @@ async def text_handler(event):
 
     # ---- Set Cycles ----
     elif action == "await_cycles":
+        settings = await get_settings(uid)
+        cap = max_cycles_for(settings)
         try:
             n = int(text)
-            if not 1 <= n <= 100:
+            if not 1 <= n <= cap:
                 raise ValueError
         except ValueError:
-            await event.respond("❌ Enter a number between **1** and **100**."); return
+            await event.respond(
+                f"❌ Enter a number between **1** and **{cap}**"
+                + (" (Premium pe zyada milta hai)." if not is_premium_user(settings) else ".")
+            )
+            return
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "UPDATE user_settings SET max_cycles=$1 WHERE user_id=$2", n, uid
@@ -1188,6 +1380,83 @@ async def addtarget_handler(event):
     await event.respond(f"✅ Target `{title}` added.", buttons=[[Button.inline("🔙 Dashboard", b"menu_main")]])
 
 # ---------------------------------------------------------------------------
+# Admin: grant / revoke Premium
+# ---------------------------------------------------------------------------
+
+async def premium_admin_handler(event):
+    """
+    Admin-only commands:
+      /premium <telegram_user_id>
+      /unpremium <telegram_user_id>
+      /premiumstatus <telegram_user_id>
+    """
+    uid = event.sender_id
+    if not is_admin(uid):
+        await event.respond("❌ Admin only.")
+        return
+
+    parts = event.text.strip().split()
+    cmd = parts[0].split("@")[0].lower()  # /premium@BotName → /premium
+
+    if len(parts) < 2 or not parts[1].isdigit():
+        await event.respond(
+            "**Admin Premium Commands**\n\n"
+            "`/premium <user_id>` — grant premium\n"
+            "`/unpremium <user_id>` — remove premium\n"
+            "`/premiumstatus <user_id>` — check plan\n\n"
+            "User ID kaise mile: user se bot pe /start karwao, "
+            "ya unka ID @userinfobot se lo."
+        )
+        return
+
+    target_id = int(parts[1])
+    await get_settings(target_id)  # ensure row exists
+
+    if cmd == "/premium":
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE user_settings SET is_premium=TRUE WHERE user_id=$1",
+                target_id,
+            )
+        await event.respond(f"✅ Premium granted to `{target_id}`")
+        try:
+            await bot_client.send_message(
+                target_id,
+                "⭐ **Premium activated!**\n\n"
+                f"Ab tak accounts: **{PREMIUM_MAX_ACCOUNTS}**, "
+                f"cycles: **{PREMIUM_MAX_CYCLES}**, AI reply unlocked.\n"
+                "Dashboard refresh: /start",
+            )
+        except Exception as e:
+            logger.warning(f"Could not notify user {target_id}: {e}")
+
+    elif cmd == "/unpremium":
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE user_settings SET is_premium=FALSE, ai_reply=FALSE WHERE user_id=$1",
+                target_id,
+            )
+        await event.respond(f"✅ Premium removed from `{target_id}`")
+        try:
+            await bot_client.send_message(
+                target_id,
+                "ℹ️ Aapka plan ab **free** hai.",
+            )
+        except Exception as e:
+            logger.warning(f"Could not notify user {target_id}: {e}")
+
+    elif cmd == "/premiumstatus":
+        s = await get_settings(target_id)
+        plan = "premium ⭐" if is_premium_user(s) else "free"
+        await event.respond(
+            f"User `{target_id}`\n"
+            f"Plan: **{plan}**\n"
+            f"Max accounts: **{max_accounts_for(s)}**\n"
+            f"Max cycles: **{max_cycles_for(s)}**\n"
+            f"AI reply: **{'ON' if s.get('ai_reply') else 'OFF'}**"
+        )
+
+# ---------------------------------------------------------------------------
 # Health-Check Server  (Koyeb / Railway / Render)
 # ---------------------------------------------------------------------------
 
@@ -1241,6 +1510,10 @@ async def main() -> None:
     def _register_handlers(client):
         client.add_event_handler(start_handler,      events.NewMessage(pattern="/start"))
         client.add_event_handler(addtarget_handler,  events.NewMessage(pattern="/addtarget"))
+        client.add_event_handler(
+            premium_admin_handler,
+            events.NewMessage(pattern=r"^/(premium|unpremium|premiumstatus)(@\w+)?(\s|$)"),
+        )
         client.add_event_handler(verify_sub_handler, events.CallbackQuery(data=b"verify_sub"))
         client.add_event_handler(menu_handler,       events.CallbackQuery(pattern=b"menu_.*"))
         client.add_event_handler(action_handler,     events.CallbackQuery(pattern=b"act_.*"))
@@ -1269,6 +1542,9 @@ async def main() -> None:
         logger_client.add_event_handler(
             logger_start_handler, events.NewMessage(pattern="/start")
         )
+        logger_client.add_event_handler(
+            logger_callback_handler, events.CallbackQuery(pattern=b"log.*")
+        )
         while True:
             try:
                 await logger_client.start(bot_token=LOGGER_BOT_TOKEN)
@@ -1279,6 +1555,9 @@ async def main() -> None:
                 logger_client = TelegramClient(StringSession(""), API_ID, API_HASH)
                 logger_client.add_event_handler(
                     logger_start_handler, events.NewMessage(pattern="/start")
+                )
+                logger_client.add_event_handler(
+                    logger_callback_handler, events.CallbackQuery(pattern=b"log.*")
                 )
         me = await logger_client.get_me()
         logger.info(f"Logger Bot is live (@{me.username}).")

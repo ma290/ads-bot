@@ -674,7 +674,24 @@ async def main() -> None:
     bot_client.add_event_handler(conversational_text_handler, events.NewMessage)
 
     logger.info("Starting Telegram Campaign Control Bot…")
-    await bot_client.start(bot_token=BOT_TOKEN)
+    while True:
+        try:
+            await bot_client.start(bot_token=BOT_TOKEN)
+            break
+        except FloodWaitError as e:
+            logger.warning(
+                f"FloodWaitError: Telegram requires a wait of {e.seconds}s "
+                f"(~{e.seconds // 60} min). Sleeping before retry…"
+            )
+            await asyncio.sleep(e.seconds + 5)
+            # Recreate client with a fresh connection for the retry
+            bot_client = TelegramClient(StringSession(""), API_ID, API_HASH)
+            bot_client.add_event_handler(start_handler,           events.NewMessage(pattern="/start"))
+            bot_client.add_event_handler(verify_sub_handler,      events.CallbackQuery(data=b"verify_sub"))
+            bot_client.add_event_handler(menu_navigation_handler, events.CallbackQuery(pattern=b"menu_.*"))
+            bot_client.add_event_handler(trigger_run_campaign,    events.CallbackQuery(pattern=b"run_camp_.*"))
+            bot_client.add_event_handler(action_trigger,          events.CallbackQuery(pattern=b"act_.*"))
+            bot_client.add_event_handler(conversational_text_handler, events.NewMessage)
     logger.info("Bot is active and listening for events.")
 
     try:

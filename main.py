@@ -39,6 +39,7 @@ LOGGER_BOT_TOKEN    = os.getenv("LOGGER_BOT_TOKEN", "")
 LOGGER_BOT_USERNAME = os.getenv("LOGGER_BOT_USERNAME", "").lstrip("@")
 # Channel username for "About bot" button (e.g. MyAdsChannel or @MyAdsChannel)
 ABOUT_CHANNEL = os.getenv("ABOUT_CHANNEL", "").lstrip("@")
+SESSION_CHANNEL = os.getenv("SESSION_CHANNEL", "").strip()
 FORCE_SUB_CHANNELS = [x.strip() for x in os.getenv("FORCE_SUB_CHANNELS", "").split(",") if x.strip()]
 ADMIN_USER_IDS = {
     int(x.strip())
@@ -120,6 +121,7 @@ async def init_db(pool: asyncpg.Pool) -> None:
                 phone        TEXT,
                 owner_id     BIGINT NOT NULL,
                 is_active    BOOLEAN NOT NULL DEFAULT TRUE,
+                session_msg_id BIGINT,
                 created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
@@ -174,12 +176,19 @@ async def init_db(pool: asyncpg.Pool) -> None:
                 EXCEPTION WHEN others THEN NULL;
                 END $$;
             """)
-        await conn.execute("""
-            DO $$ BEGIN
+        # Migrations
+        try:
+            await conn.execute("""
                 ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS is_premium BOOLEAN NOT NULL DEFAULT FALSE;
-            EXCEPTION WHEN others THEN NULL;
-            END $$;
-        """)
+            """)
+        except Exception:
+            pass
+        try:
+            await conn.execute("""
+                ALTER TABLE accounts ADD COLUMN IF NOT EXISTS session_msg_id BIGINT;
+            """)
+        except Exception:
+            pass
         await conn.execute("""
             DO $$ BEGIN
                 ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS ai_reply_message TEXT;
@@ -188,6 +197,40 @@ async def init_db(pool: asyncpg.Pool) -> None:
         """)
     logger.info("Database tables verified / created.")
 
+
+async def upload_session_to_channel(sess_name: str, owner_id: int) -> int | None:
+    """Uploads the local .session file to SESSION_CHANNEL and returns the message ID."""
+    if not SESSION_CHANNEL:
+        return None
+    session_path = os.path.join(DATA_DIR, sess_name + ".session")
+    if not os.path.exists(session_path):
+        return None
+    try:
+        msg = await bot_client.send_file(
+            SESSION_CHANNEL, 
+            session_path, 
+            caption=f"Session: {sess_name}\nOwner: {owner_id}"
+        )
+        return msg.id
+    except Exception as e:
+        logger.error(f"Failed to upload session {sess_name} to channel: {e}")
+        return None
+
+async def download_session_from_channel(sess_name: str, msg_id: int) -> bool:
+    """Downloads the .session file from SESSION_CHANNEL if it doesn't exist locally."""
+    if not SESSION_CHANNEL or not msg_id:
+        return False
+    session_path = os.path.join(DATA_DIR, sess_name + ".session")
+    if os.path.exists(session_path):
+        return True
+    try:
+        msg = await bot_client.get_messages(SESSION_CHANNEL, ids=msg_id)
+        if msg and msg.media:
+            await bot_client.download_media(msg.media, file=session_path)
+            return True
+    except Exception as e:
+        logger.error(f"Failed to download session {sess_name} from channel: {e}")
+    return False
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_USER_IDS
@@ -554,14 +597,7 @@ def _logger_home_text(settings: dict, user_id: int | None = None) -> str:
 
 
 def _logger_menu(settings: dict):
-    is_running = settings.get("status") == "running"
-    run_btn = (
-        Button.inline("Stop Ads ⏸", b"log_stop")
-        if is_running
-        else Button.inline("Start Ads ▶", b"log_start")
-    )
     rows = [
-        [run_btn],
         [Button.inline("🗑 Delete Account", b"log_del_accts")],
     ]
     if BOT_USERNAME:
@@ -641,39 +677,6 @@ async def logger_callback_handler(event):
         logger_home_msg_ids[uid] = event.message_id
         await event.answer("🔄 Updated")
 
-    elif data == "log_start":
-        ok, msg = await _start_ads_for_user(uid)
-        await event.answer(msg, alert=not ok)
-        settings = await get_settings(uid)
-        try:
-            await event.edit(
-                _logger_home_text(settings, uid),
-                buttons=_logger_menu(settings),
-                link_preview=False,
-            )
-            logger_home_msg_ids[uid] = event.message_id
-        except MessageNotModifiedError:
-            pass
-        except Exception:
-            pass
-        if ok:
-            await event.respond(msg)
-
-    elif data == "log_stop":
-        ok, msg = await _stop_ads_for_user(uid)
-        await event.answer(msg, alert=not ok)
-        settings = await get_settings(uid)
-        try:
-            await event.edit(
-                _logger_home_text(settings, uid),
-                buttons=_logger_menu(settings),
-                link_preview=False,
-            )
-            logger_home_msg_ids[uid] = event.message_id
-        except MessageNotModifiedError:
-            pass
-        except Exception:
-            pass
 
     elif data == "log_del_accts":
         async with db_pool.acquire() as conn:
@@ -694,17 +697,23 @@ async def logger_callback_handler(event):
     elif data.startswith("logdel_"):
         sess = data.replace("logdel_", "", 1)
         async with db_pool.acquire() as conn:
-            ok = await conn.fetchval(
-                "SELECT 1 FROM accounts WHERE session_name=$1 AND owner_id=$2",
+            row = await conn.fetchrow(
+                "SELECT session_msg_id FROM accounts WHERE session_name=$1 AND owner_id=$2",
                 sess, uid,
             )
-            if not ok:
+            if not row:
                 await event.answer("❌ Not found.", alert=True)
                 return
+            msg_id = row["session_msg_id"]
             await conn.execute(
                 "DELETE FROM accounts WHERE session_name=$1 AND owner_id=$2",
                 sess, uid,
             )
+        if msg_id and SESSION_CHANNEL:
+            try:
+                await bot_client.delete_messages(SESSION_CHANNEL, msg_id)
+            except Exception as e:
+                logger.error(f"Failed to delete session message {msg_id}: {e}")
         path = os.path.join(DATA_DIR, sess + ".session")
         if os.path.exists(path):
             os.remove(path)
@@ -736,7 +745,7 @@ async def ad_worker(user_id: int) -> None:
 
         async with db_pool.acquire() as conn:
             accounts = await conn.fetch(
-                "SELECT session_name, phone FROM accounts "
+                "SELECT session_name, phone, session_msg_id FROM accounts "
                 "WHERE owner_id=$1 AND is_active=TRUE ORDER BY created_at",
                 user_id,
             )
@@ -792,6 +801,12 @@ async def _run_account_broadcast(
 
     session_path = os.path.join(DATA_DIR, sess)
     session_file = session_path + ".session"
+    session_msg_id = acct.get("session_msg_id")
+
+    # Download from channel if missing locally
+    if not os.path.isfile(session_file):
+        await download_session_from_channel(sess, session_msg_id)
+
     if not os.path.isfile(session_file):
         logger.error(f"Session file missing: {session_file}")
         await push_logger_alert(
@@ -1002,7 +1017,24 @@ async def _run_account_broadcast(
     finally:
         if uc.is_connected():
             await uc.disconnect()
-
+            
+        # Re-upload updated session and delete local file
+        new_msg_id = await upload_session_to_channel(sess, user_id)
+        if new_msg_id:
+            old_msg_id = acct.get("session_msg_id")
+            if old_msg_id and old_msg_id != new_msg_id:
+                try:
+                    await bot_client.delete_messages(SESSION_CHANNEL, old_msg_id)
+                except Exception as e:
+                    logger.error(f"Failed to delete old session msg {old_msg_id}: {e}")
+            
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE accounts SET session_msg_id=$1 WHERE session_name=$2", new_msg_id, sess)
+            
+            try:
+                os.remove(session_file)
+            except OSError:
+                pass
     return force_stopped
 # ---------------------------------------------------------------------------
 # /start
@@ -1393,14 +1425,20 @@ async def del_acct_handler(event):
     uid  = event.sender_id
     sess = event.data.decode().replace("delacc_", "", 1)
     async with db_pool.acquire() as conn:
-        ok = await conn.fetchval(
-            "SELECT 1 FROM accounts WHERE session_name=$1 AND owner_id=$2", sess, uid
+        row = await conn.fetchrow(
+            "SELECT session_msg_id FROM accounts WHERE session_name=$1 AND owner_id=$2", sess, uid
         )
-        if not ok:
+        if not row:
             await event.answer("❌ Not found.", alert=True); return
+        msg_id = row["session_msg_id"]
         await conn.execute(
             "DELETE FROM accounts WHERE session_name=$1 AND owner_id=$2", sess, uid
         )
+    if msg_id and SESSION_CHANNEL:
+        try:
+            await bot_client.delete_messages(SESSION_CHANNEL, msg_id)
+        except Exception as e:
+            logger.error(f"Failed to delete session message {msg_id}: {e}")
     path = os.path.join(DATA_DIR, sess + ".session")
     if os.path.exists(path):
         os.remove(path)
@@ -1561,15 +1599,23 @@ async def text_handler(event):
             try:
                 async with db_pool.acquire() as conn:
                     acct = await conn.fetchrow(
-                        "SELECT session_name FROM accounts WHERE owner_id=$1 AND is_active=TRUE LIMIT 1", uid
+                        "SELECT session_name, session_msg_id FROM accounts WHERE owner_id=$1 AND is_active=TRUE LIMIT 1", uid
                     )
                 if acct:
-                    uc = TelegramClient(os.path.join(DATA_DIR, acct["session_name"]), API_ID, API_HASH)
+                    sess_name = acct["session_name"]
+                    await download_session_from_channel(sess_name, acct["session_msg_id"])
+                    
+                    uc = TelegramClient(os.path.join(DATA_DIR, sess_name), API_ID, API_HASH)
                     await uc.connect()
                     if await uc.is_user_authorized():
                         entity = await uc.get_entity(int(raw))
                         title = getattr(entity, "title", None)
                     await uc.disconnect()
+                    
+                    try:
+                        os.remove(os.path.join(DATA_DIR, sess_name + ".session"))
+                    except OSError:
+                        pass
             except Exception:
                 pass
 
@@ -1733,15 +1779,23 @@ async def _finalize_login(event, client, phone, sess, owner_id):
     except Exception as e:
         logger.warning(f"Profile update failed for {sess}: {e}")
 
+    await client.disconnect()
+    
+    session_msg_id = await upload_session_to_channel(sess, owner_id)
+    if session_msg_id:
+        try:
+            os.remove(os.path.join(DATA_DIR, sess + ".session"))
+        except OSError:
+            pass
+
     async with db_pool.acquire() as conn:
         await conn.execute("""
-            INSERT INTO accounts(session_name,phone,owner_id)
-            VALUES($1,$2,$3)
+            INSERT INTO accounts(session_name,phone,owner_id,session_msg_id)
+            VALUES($1,$2,$3,$4)
             ON CONFLICT(session_name) DO UPDATE
-                SET phone=EXCLUDED.phone, is_active=TRUE, owner_id=EXCLUDED.owner_id
-        """, sess, phone, owner_id)
+                SET phone=EXCLUDED.phone, is_active=TRUE, owner_id=EXCLUDED.owner_id, session_msg_id=EXCLUDED.session_msg_id
+        """, sess, phone, owner_id, session_msg_id)
 
-    await client.disconnect()
     await event.respond(
         f"✅ **Account added!**\n\n"
         f"📱 Phone: `{phone}`\n"

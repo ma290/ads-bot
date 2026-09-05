@@ -35,6 +35,8 @@ BOT_TOKEN    = os.getenv("BOT_TOKEN", "")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 LOGGER_BOT_TOKEN    = os.getenv("LOGGER_BOT_TOKEN", "")
 LOGGER_BOT_USERNAME = os.getenv("LOGGER_BOT_USERNAME", "").lstrip("@")
+# Channel username for "About bot" button (e.g. MyAdsChannel or @MyAdsChannel)
+ABOUT_CHANNEL = os.getenv("ABOUT_CHANNEL", "").lstrip("@")
 FORCE_SUB_CHANNELS = [x.strip() for x in os.getenv("FORCE_SUB_CHANNELS", "").split(",") if x.strip()]
 ADMIN_USER_IDS = {
     int(x.strip())
@@ -57,6 +59,13 @@ FREE_MAX_AI_REPLIES  = int(os.getenv("FREE_MAX_AI_REPLIES", "20"))
 DATA_DIR = os.path.abspath("data")
 os.makedirs(DATA_DIR, exist_ok=True)
 LOG_PATH = os.path.join(DATA_DIR, "app.log")
+
+# Welcome / landing banner (Tecxo-style photo + Start Bot card)
+_ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+WELCOME_BANNER = os.getenv(
+    "WELCOME_BANNER",
+    os.path.join(_ASSETS_DIR, "welcome_banner.png"),
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -236,6 +245,19 @@ def _fmt_interval(seconds: int) -> str:
     return f"{m} minutes" if m else f"{s}s"
 
 
+def welcome_caption() -> str:
+    handle = f"@{BOT_USERNAME}" if BOT_USERNAME else "AdsBot"
+    return (
+        f"**{handle}** — A Telegram Advertisement service. 🚀\n\n"
+        "⚙️ **Automate your advertisements on Telegram with Ads Bot.** ⚙️\n\n"
+        "Powered by **@mrvoidance**"
+    )
+
+
+def welcome_buttons():
+    return [[Button.inline("Start Bot ↗️", b"menu_open")]]
+
+
 def dashboard_text(settings: dict, acct_count: int) -> str:
     svc = "__set__" if settings["ad_message"] else "__not set__"
     status_map = {
@@ -248,17 +270,17 @@ def dashboard_text(settings: dict, acct_count: int) -> str:
     interval_str = _fmt_interval(settings["cycle_interval"])
     plan = "premium ⭐" if is_premium_user(settings) else "free"
     acct_cap = max_accounts_for(settings)
+    handle = f"@{BOT_USERNAME}" if BOT_USERNAME else "AdsBot"
 
     return (
-        f"━━━━━ **Powered by @mrvoidance** ━━━━━\n"
-        f"━━━━\n\n\n"
+        f"**{handle}** — Dashboard 🚀\n"
+        f"━━━━━ **Powered by @mrvoidance** ━━━━━\n\n"
         f"• **Hosted Accounts:** __{acct_count}/{acct_cap}__\n"
         f"• **Service:** __{svc}__\n"
         f"• **Advertisement status:** __{status}__\n"
         f"• **Interval:** __{interval_str}__\n"
         f"• **Current plan:** __{plan}__\n\n"
-        f"> Developed and managed by: \"\"\n"
-        f"> **@mrvoidance**"
+        f"> Developed and managed by **@mrvoidance**"
     )
 
 
@@ -275,8 +297,23 @@ def main_menu(settings: dict):
         [Button.inline("Exclude Groups 🚫", b"menu_excl"), Button.inline("Auto join", b"act_autojoin")],
         [Button.inline("Auto reply", b"act_tgl_ai"), Button.inline("My Accounts", b"menu_accts")],
         [Button.inline("Go Premium ⭐", b"menu_premium")],
-        [Button.url("About bot ↗", f"https://t.me/{BOT_USERNAME}"), Button.url("Powered by ↗", "https://t.me/mrvoidance")],
+        [
+            Button.url(
+                "About bot ↗",
+                f"https://t.me/{ABOUT_CHANNEL or BOT_USERNAME}",
+            ),
+            Button.url("Powered by ↗", "https://t.me/mrvoidance"),
+        ],
     ]
+
+
+async def _send_welcome(event) -> None:
+    """Send Tecxo-style photo card with Start Bot button."""
+    kwargs = {"buttons": welcome_buttons()}
+    if os.path.isfile(WELCOME_BANNER):
+        kwargs["file"] = WELCOME_BANNER
+    await event.respond(welcome_caption(), **kwargs)
+
 
 # ---------------------------------------------------------------------------
 # Helper: refresh & edit dashboard into current message
@@ -716,10 +753,8 @@ async def start_handler(event):
             buttons=force_sub_kb(),
         )
         return
-    settings = await get_settings(uid)
-    async with db_pool.acquire() as conn:
-        cnt = await conn.fetchval("SELECT COUNT(*) FROM accounts WHERE owner_id=$1", uid)
-    await event.respond(dashboard_text(settings, cnt), buttons=main_menu(settings))
+    await get_settings(uid)  # ensure user row exists
+    await _send_welcome(event)
 
 # ---------------------------------------------------------------------------
 # Callback: verify subscription
@@ -728,7 +763,8 @@ async def start_handler(event):
 async def verify_sub_handler(event):
     uid = event.sender_id
     if await check_force_sub(uid):
-        await _refresh_dashboard(event, uid)
+        await event.answer("✅ Access granted!")
+        await _send_welcome(event)
     else:
         await event.answer("❌ You haven't joined all channels yet!", alert=True)
 
@@ -740,8 +776,13 @@ async def menu_handler(event):
     uid  = event.sender_id
     data = event.data.decode()
 
+    # ---- Welcome card → open dashboard ----
+    if data == "menu_open":
+        await _refresh_dashboard(event, uid)
+        await event.answer()
+
     # ---- Dashboard (back button) ----
-    if data == "menu_main":
+    elif data == "menu_main":
         await _refresh_dashboard(event, uid)
 
     # ---- Interval & delay (button-based) ----

@@ -13,10 +13,12 @@ from telethon.errors import (
     ChatWriteForbiddenError,
     UserBannedInChannelError,
     ChannelPrivateError,
+    ChatAdminRequiredError,
     UserNotParticipantError,
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
     PhoneCodeExpiredError,
+    MessageNotModifiedError,
 )
 from telethon.tl.functions.channels import GetParticipantRequest, JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
@@ -86,6 +88,7 @@ logger = logging.getLogger("AdsBot")
 # ---------------------------------------------------------------------------
 
 db_pool: asyncpg.Pool = None
+_logger_home_tasks: dict = {}
 bot_client: TelegramClient = None
 logger_client: TelegramClient = None  # separate Logger Bot
 
@@ -97,6 +100,13 @@ user_states: dict = {}   # conversational state machine
 
 # Live logger message ids  {user_id: {phone: message_id}}
 logger_msg_ids: dict = {}
+# Logger home (/start menu) message ids for auto-refresh  {user_id: message_id}
+logger_home_msg_ids: dict = {}
+# Latest per-phone live stats for auto-refresh home  {user_id: {phone: dict}}
+live_stats: dict = {}
+# Throttle home auto-edits  {user_id: monotonic_ts}
+_logger_home_last_edit: dict = {}
+LOGGER_HOME_EDIT_INTERVAL = 2.5  # seconds
 
 # ---------------------------------------------------------------------------
 # Database
@@ -228,9 +238,15 @@ async def check_force_sub(user_id: int) -> bool:
             await bot_client(GetParticipantRequest(channel=entity, participant=user_id))
         except (UserNotParticipantError, ValueError):
             return False
+        except (ChatAdminRequiredError, ChannelPrivateError) as e:
+            # Bot is not admin / can't verify — don't lock users out
+            logger.warning(
+                f"Force-sub skip for {channel} (bot needs admin to verify): {e}"
+            )
+            continue
         except Exception as e:
             logger.warning(f"Force-sub check error for {channel}: {e}")
-            return False
+            continue
     return True
 
 
@@ -277,7 +293,7 @@ def dashboard_text(settings: dict, acct_count: int) -> str:
     interval_str = _fmt_interval(settings["cycle_interval"])
     plan = "premium ⭐" if is_premium_user(settings) else "free"
     acct_cap = max_accounts_for(settings)
-    handle = f"@{BOT_USERNAME}" if BOT_USERNAME else "AdsBot"
+    handle = f"[@{BOT_USERNAME}](https://t.me/{BOT_USERNAME})" if BOT_USERNAME else "AdsBot"
 
     return (
         f"**{handle}** — Dashboard 🚀\n\n"
@@ -342,7 +358,10 @@ async def _refresh_dashboard(event, user_id: int):
         cnt = await conn.fetchval(
             "SELECT COUNT(*) FROM accounts WHERE owner_id=$1", user_id
         )
-    await event.edit(dashboard_text(settings, cnt), buttons=main_menu(settings))
+    try:
+        await event.edit(dashboard_text(settings, cnt), buttons=main_menu(settings))
+    except MessageNotModifiedError:
+        pass
 
 # ---------------------------------------------------------------------------
 # Logger Bot — live broadcast stats
@@ -392,6 +411,18 @@ async def push_logger_log(
     """Send or edit a live log message on the Logger Bot."""
     if not logger_client:
         return
+    # Cache for auto-refresh home screen
+    live_stats.setdefault(user_id, {})[phone] = {
+        "cycle": cycle,
+        "status": status,
+        "current": current,
+        "total": total,
+        "successful": successful,
+        "failed": failed,
+        "flood_wait": flood_wait,
+        "auto_replied": auto_replied,
+        "footer": footer,
+    }
     text = format_logger_message(
         phone, cycle, status, current, total,
         successful, failed, flood_wait, auto_replied, footer,
@@ -402,12 +433,19 @@ async def push_logger_log(
         if msg_id:
             try:
                 await logger_client.edit_message(user_id, msg_id, text)
+                await _maybe_refresh_logger_home(user_id)
                 return
+            except MessageNotModifiedError:
+                await _maybe_refresh_logger_home(user_id)
+                return
+            except FloodWaitError as e:
+                await asyncio.sleep(min(e.seconds, 30))
             except Exception:
                 # Message gone / too old — send a fresh one
                 pass
         msg = await logger_client.send_message(user_id, text)
         msg_map[phone] = msg.id
+        await _maybe_refresh_logger_home(user_id)
     except Exception as e:
         # User likely hasn't pressed /start on the logger bot yet
         logger.warning(f"Logger push failed for user {user_id}: {e}")
@@ -423,27 +461,96 @@ async def push_logger_alert(user_id: int, text: str) -> None:
         logger.warning(f"Logger alert failed for user {user_id}: {e}")
 
 
+async def _maybe_refresh_logger_home(user_id: int, force: bool = False) -> None:
+    """Auto-edit the Logger Bot home message so stats update without Refresh."""
+    if not logger_client:
+        return
+    msg_id = logger_home_msg_ids.get(user_id)
+    if not msg_id:
+        return
+    
+    now = asyncio.get_event_loop().time()
+    last = _logger_home_last_edit.get(user_id, 0)
+    
+    if force or (now - last) >= LOGGER_HOME_EDIT_INTERVAL:
+        _logger_home_last_edit[user_id] = now
+        task = _logger_home_tasks.pop(user_id, None)
+        if task:
+            task.cancel()
+        await _do_logger_home_edit(user_id, msg_id)
+    else:
+        if user_id not in _logger_home_tasks:
+            delay = LOGGER_HOME_EDIT_INTERVAL - (now - last)
+            async def delayed_edit():
+                await asyncio.sleep(delay)
+                _logger_home_last_edit[user_id] = asyncio.get_event_loop().time()
+                _logger_home_tasks.pop(user_id, None)
+                await _do_logger_home_edit(user_id, msg_id)
+            _logger_home_tasks[user_id] = asyncio.create_task(delayed_edit())
+
+async def _do_logger_home_edit(user_id: int, msg_id: int) -> None:
+    try:
+        settings = await get_settings(user_id)
+        await logger_client.edit_message(
+            user_id,
+            msg_id,
+            _logger_home_text(settings, user_id),
+            buttons=_logger_menu(settings),
+        )
+    except MessageNotModifiedError:
+        pass
+    except Exception as e:
+        logger.debug(f"Logger home auto-refresh failed for {user_id}: {e}")
+
+
 async def logger_start_handler(event):
     """ /start on the Logger Bot — menu + enable DMs for live stats. """
     uid = event.sender_id
     settings = await get_settings(uid)
-    await event.respond(
-        _logger_home_text(settings),
+    msg = await event.respond(
+        _logger_home_text(settings, uid),
         buttons=_logger_menu(settings),
+        link_preview=False,
     )
+    logger_home_msg_ids[uid] = msg.id
 
 
-def _logger_home_text(settings: dict) -> str:
+def _logger_home_text(settings: dict, user_id: int | None = None) -> str:
     status = settings.get("status", "paused")
+    status_map = {
+        "paused": "stopped 🔴",
+        "running": "running ▶️",
+        "completed": "completed ✅",
+        "stopped": "stopped 🔴",
+    }
+    status_disp = status_map.get(status, status)
+    ads_line = ""
+    if BOT_USERNAME:
+        ads_line = f"Ads bot: [@{BOT_USERNAME}](https://t.me/{BOT_USERNAME})\n"
+
+    live_block = ""
+    if user_id is not None:
+        stats_map = live_stats.get(user_id) or {}
+        if stats_map:
+            parts = []
+            for phone, st in stats_map.items():
+                parts.append(
+                    f"📱 `{phone}` — **{st.get('status', '?')}** · "
+                    f"{st.get('current', 0)}/{st.get('total', 0)} · "
+                    f"✅{st.get('successful', 0)} ❌{st.get('failed', 0)}"
+                )
+            live_block = "\n**Live (auto-updating):**\n" + "\n".join(parts) + "\n"
+
     return (
         "📊 **Logger Bot**\n\n"
-        "Live ad stats yahan aate hain:\n"
+        "Live ad stats yahan aate hain (auto-refresh):\n"
         "• Kitne ads run hue\n"
         "• Kitne **successful** ✅ / **failed** ❌\n"
         "• Flood wait / auto-reply\n\n"
-        f"Advertisement status: **{status}**\n"
-        f"{'Ads bot: @' + BOT_USERNAME if BOT_USERNAME else ''}"
-    )
+        f"Advertisement status: **{status_disp}**\n"
+        f"{ads_line}"
+        f"{live_block}"
+    ).rstrip()
 
 
 def _logger_menu(settings: dict):
@@ -453,15 +560,25 @@ def _logger_menu(settings: dict):
         if is_running
         else Button.inline("Start Ads ▶", b"log_start")
     )
-    return [
+    rows = [
         [run_btn],
         [Button.inline("🗑 Delete Account", b"log_del_accts")],
-        [Button.inline("🔄 Refresh", b"log_home")],
     ]
+    if BOT_USERNAME:
+        rows.append([
+            Button.url(f"🤖 @{BOT_USERNAME}", f"https://t.me/{BOT_USERNAME}"),
+        ])
+    rows.append([Button.inline("🔄 Refresh", b"log_home")])
+    return rows
 
 
 async def _start_ads_for_user(uid: int) -> tuple[bool, str]:
     """Shared start logic. Returns (ok, message)."""
+    # Clear stale task / stuck "running" status from a previous crash
+    old = active_tasks.get(uid)
+    if old and old.done():
+        active_tasks.pop(uid, None)
+        stop_events.pop(uid, None)
     if uid in active_tasks and not active_tasks[uid].done():
         return False, "⚠️ Ads already running!"
     s = await get_settings(uid)
@@ -473,6 +590,18 @@ async def _start_ads_for_user(uid: int) -> tuple[bool, str]:
         )
     if ac == 0:
         return False, "❌ Add an account first (on Ads Bot)!"
+    # Verify at least one session file exists on disk
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT session_name FROM accounts WHERE owner_id=$1 AND is_active=TRUE", uid
+        )
+    missing = [
+        r["session_name"]
+        for r in rows
+        if not os.path.isfile(os.path.join(DATA_DIR, r["session_name"] + ".session"))
+    ]
+    if len(missing) == len(rows):
+        return False, "❌ Session file missing — account dubara add karo!"
     async with db_pool.acquire() as conn:
         await conn.execute(
             "UPDATE user_settings SET status='running', current_cycle=0 WHERE user_id=$1",
@@ -480,7 +609,7 @@ async def _start_ads_for_user(uid: int) -> tuple[bool, str]:
         )
     stop_events[uid] = asyncio.Event()
     active_tasks[uid] = asyncio.create_task(ad_worker(uid))
-    return True, "▶️ Ads started! Live logs yahan update honge."
+    return True, "▶️ Ads started! Live logs yahan auto-update honge."
 
 
 async def _stop_ads_for_user(uid: int) -> tuple[bool, str]:
@@ -501,15 +630,30 @@ async def logger_callback_handler(event):
 
     if data == "log_home":
         settings = await get_settings(uid)
-        await event.edit(_logger_home_text(settings), buttons=_logger_menu(settings))
-        await event.answer()
+        try:
+            await event.edit(
+                _logger_home_text(settings, uid),
+                buttons=_logger_menu(settings),
+                link_preview=False,
+            )
+        except MessageNotModifiedError:
+            pass
+        logger_home_msg_ids[uid] = event.message_id
+        await event.answer("🔄 Updated")
 
     elif data == "log_start":
         ok, msg = await _start_ads_for_user(uid)
         await event.answer(msg, alert=not ok)
         settings = await get_settings(uid)
         try:
-            await event.edit(_logger_home_text(settings), buttons=_logger_menu(settings))
+            await event.edit(
+                _logger_home_text(settings, uid),
+                buttons=_logger_menu(settings),
+                link_preview=False,
+            )
+            logger_home_msg_ids[uid] = event.message_id
+        except MessageNotModifiedError:
+            pass
         except Exception:
             pass
         if ok:
@@ -520,7 +664,14 @@ async def logger_callback_handler(event):
         await event.answer(msg, alert=not ok)
         settings = await get_settings(uid)
         try:
-            await event.edit(_logger_home_text(settings), buttons=_logger_menu(settings))
+            await event.edit(
+                _logger_home_text(settings, uid),
+                buttons=_logger_menu(settings),
+                link_preview=False,
+            )
+            logger_home_msg_ids[uid] = event.message_id
+        except MessageNotModifiedError:
+            pass
         except Exception:
             pass
 
@@ -560,42 +711,111 @@ async def logger_callback_handler(event):
         await event.answer(f"✅ {sess} deleted.")
         settings = await get_settings(uid)
         await event.edit(
-            f"✅ Account `{sess}` deleted.\n\n" + _logger_home_text(settings),
+            f"✅ Account `{sess}` deleted.\n\n" + _logger_home_text(settings, uid),
             buttons=_logger_menu(settings),
+            link_preview=False,
         )
+        logger_home_msg_ids[uid] = event.message_id
 
 # ---------------------------------------------------------------------------
-# Ad Dispatch Worker  (one per user)
+# Ad Dispatch Worker  (one per user — runs all active accounts)
 # ---------------------------------------------------------------------------
 
 async def ad_worker(user_id: int) -> None:
     logger.info(f"Ad worker started for user {user_id}")
     stop = stop_events.get(user_id)
+    force_stopped = False
 
-    settings = await get_settings(user_id)
-    ad_msg   = settings["ad_message"]
-    max_cyc  = min(int(settings["max_cycles"]), max_cycles_for(settings))
-    interval = settings["cycle_interval"]  # delay between full cycles
+    try:
+        settings = await get_settings(user_id)
+        ad_msg = settings["ad_message"]
+        if not ad_msg:
+            logger.error(f"User {user_id}: no ad message.")
+            await push_logger_alert(user_id, "❌ No ad message set — ads cancelled.")
+            return
+
+        async with db_pool.acquire() as conn:
+            accounts = await conn.fetch(
+                "SELECT session_name, phone FROM accounts "
+                "WHERE owner_id=$1 AND is_active=TRUE ORDER BY created_at",
+                user_id,
+            )
+        if not accounts:
+            logger.error(f"User {user_id}: no active account.")
+            await push_logger_alert(user_id, "❌ No active account — ads cancelled.")
+            return
+
+        live_stats.pop(user_id, None)
+        logger_msg_ids.pop(user_id, None)
+
+        # Run every active account (sequential — safer for flood limits)
+        for acct in accounts:
+            if stop and stop.is_set():
+                force_stopped = True
+                break
+            stopped = await _run_account_broadcast(user_id, acct, settings, stop)
+            if stopped:
+                force_stopped = True
+                break
+    except Exception as e:
+        logger.exception(f"Ad worker crashed for user {user_id}: {e}")
+        await push_logger_alert(user_id, f"❌ Ads crashed: `{e}`")
+    finally:
+        final = "stopped" if force_stopped or (stop and stop.is_set()) else "completed"
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE user_settings SET status=$1 WHERE user_id=$2",
+                    final, user_id,
+                )
+        except Exception as e:
+            logger.error(f"Failed to set final status for {user_id}: {e}")
+        active_tasks.pop(user_id, None)
+        stop_events.pop(user_id, None)
+        await _maybe_refresh_logger_home(user_id, force=True)
+        logger.info(f"Ad worker user {user_id} → {final}")
+
+
+async def _run_account_broadcast(
+    user_id: int, acct, settings: dict, stop: asyncio.Event | None
+) -> bool:
+    """Broadcast ads for one account. Returns True if force-stopped."""
+    sess = acct["session_name"]
+    phone = acct["phone"] or f"+{sess}"
+    ad_msg = settings["ad_message"]
+    max_cyc = min(int(settings["max_cycles"]), max_cycles_for(settings))
+    interval = settings["cycle_interval"]
     ai_reply_on = bool(settings.get("ai_reply", False))
     ai_reply_msg = (settings.get("ai_reply_message") or "").strip()
     premium = is_premium_user(settings)
-    ai_reply_cap = None if premium else FREE_MAX_AI_REPLIES  # None = unlimited
+    ai_reply_cap = None if premium else FREE_MAX_AI_REPLIES
 
-    if not ad_msg:
-        logger.error(f"User {user_id}: no ad message."); return
-
-    async with db_pool.acquire() as conn:
-        acct = await conn.fetchrow(
-            "SELECT session_name, phone FROM accounts WHERE owner_id=$1 AND is_active=TRUE LIMIT 1",
+    session_path = os.path.join(DATA_DIR, sess)
+    session_file = session_path + ".session"
+    if not os.path.isfile(session_file):
+        logger.error(f"Session file missing: {session_file}")
+        await push_logger_alert(
             user_id,
+            f"**Failed to start account** `{phone}`\n\n"
+            f"Session file missing on server — re-add the account. ❌",
         )
-    if not acct:
-        logger.error(f"User {user_id}: no active account."); return
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE accounts SET is_active=FALSE WHERE session_name=$1", sess
+            )
+        return False
 
-    sess  = acct["session_name"]
-    phone = acct["phone"] or f"+{sess}"
-    uc = TelegramClient(os.path.join(DATA_DIR, sess), API_ID, API_HASH)
-    await uc.connect()
+    uc = TelegramClient(session_path, API_ID, API_HASH)
+    try:
+        await uc.connect()
+    except Exception as e:
+        logger.error(f"Connect failed for {sess}: {e}")
+        await push_logger_alert(
+            user_id,
+            f"**Failed to start account** `{phone}`\n\nConnect error: `{e}` ❌",
+        )
+        return False
+
     if not await uc.is_user_authorized():
         logger.error(f"Session '{sess}' unauthorized.")
         await push_logger_alert(
@@ -608,11 +828,9 @@ async def ad_worker(user_id: int) -> None:
                 "UPDATE accounts SET is_active=FALSE WHERE session_name=$1", sess
             )
         await uc.disconnect()
-        return
+        return False
 
-    # Clear previous logger message for this phone so a fresh cycle log starts
     logger_msg_ids.get(user_id, {}).pop(phone, None)
-
     force_stopped = False
     try:
         for cycle in range(1, max_cyc + 1):
@@ -645,16 +863,26 @@ async def ad_worker(user_id: int) -> None:
                 entity = dialog.entity
                 if isinstance(entity, Chat):
                     if str(entity.id) not in excluded_ids:
-                        all_groups.append({"id": entity.id, "title": entity.title})
+                        all_groups.append({"id": entity.id, "title": entity.title, "entity": entity})
                 elif isinstance(entity, Channel) and entity.megagroup:
                     if str(entity.id) not in excluded_ids:
-                        all_groups.append({"id": entity.id, "title": entity.title})
+                        all_groups.append({"id": entity.id, "title": entity.title, "entity": entity})
 
             total = len(all_groups)
             logger.info(
-                f"User {user_id}: cycle {cycle}/{max_cyc}, "
+                f"User {user_id}/{phone}: cycle {cycle}/{max_cyc}, "
                 f"found {total} groups (excl {len(excluded_ids)})"
             )
+
+            if total == 0:
+                await push_logger_log(
+                    user_id, phone,
+                    cycle=cycle, status="no groups",
+                    current=0, total=0,
+                    successful=0, failed=0, flood_wait=0, auto_replied=0,
+                    footer="⚠️ Is account pe koi group/supergroup nahi mila.",
+                )
+                break
 
             await push_logger_log(
                 user_id, phone,
@@ -671,7 +899,7 @@ async def ad_worker(user_id: int) -> None:
                 sent_msg = None
                 while retries <= MAX_RETRIES and not (stop and stop.is_set()):
                     try:
-                        sent_msg = await uc.send_message(grp["id"], ad_msg)
+                        sent_msg = await uc.send_message(grp["entity"], ad_msg)
                         ok = True
                         break
                     except FloodWaitError as e:
@@ -696,7 +924,6 @@ async def ad_worker(user_id: int) -> None:
 
                 if ok:
                     successful += 1
-                    # Auto-reply: send set message as reply to the ad (free capped / premium unlimited)
                     if (
                         ai_reply_on
                         and ai_reply_msg
@@ -705,7 +932,7 @@ async def ad_worker(user_id: int) -> None:
                     ):
                         try:
                             await uc.send_message(
-                                grp["id"], ai_reply_msg, reply_to=sent_msg.id
+                                grp["entity"], ai_reply_msg, reply_to=sent_msg.id
                             )
                             auto_replied += 1
                         except FloodWaitError as e:
@@ -720,11 +947,11 @@ async def ad_worker(user_id: int) -> None:
 
                 async with db_pool.acquire() as conn:
                     await conn.execute(
-                        "INSERT INTO ad_logs(owner_id,chat_id,status,error_message) VALUES($1,$2,$3,$4)",
+                        "INSERT INTO ad_logs(owner_id,chat_id,status,error_message) "
+                        "VALUES($1,$2,$3,$4)",
                         user_id, str(grp["id"]), "sent" if ok else "failed", err,
                     )
 
-                # Update logger every message (edit in-place)
                 await push_logger_log(
                     user_id, phone,
                     cycle=cycle, status="running",
@@ -735,10 +962,8 @@ async def ad_worker(user_id: int) -> None:
 
                 if not (stop and stop.is_set()):
                     delay = random.uniform(MIN_DELAY, MAX_DELAY)
-                    logger.debug(f"User {user_id}: sleeping {delay:.1f}s before next message")
                     await asyncio.sleep(delay)
 
-            # End-of-cycle logger update
             cycle_status = "incomplete" if force_stopped else "complete"
             footer = ""
             if force_stopped:
@@ -759,23 +984,26 @@ async def ad_worker(user_id: int) -> None:
                 break
             if cycle < max_cyc and not (stop and stop.is_set()):
                 logger.info(
-                    f"User {user_id}: cycle {cycle}/{max_cyc} done, "
+                    f"User {user_id}/{phone}: cycle {cycle}/{max_cyc} done, "
                     f"sleeping {interval}s before next cycle"
                 )
-                await asyncio.sleep(interval)
+                # Interruptible sleep between cycles
+                remaining = float(interval)
+                while remaining > 0 and not (stop and stop.is_set()):
+                    step = min(5.0, remaining)
+                    await asyncio.sleep(step)
+                    remaining -= step
+                if stop and stop.is_set():
+                    force_stopped = True
+                    break
             elif stop and stop.is_set():
                 force_stopped = True
                 break
     finally:
-        final = "stopped" if force_stopped or (stop and stop.is_set()) else "completed"
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE user_settings SET status=$1 WHERE user_id=$2", final, user_id,
-            )
-        await uc.disconnect()
-        active_tasks.pop(user_id, None)
-        stop_events.pop(user_id, None)
-        logger.info(f"Ad worker user {user_id} → {final}")
+        if uc.is_connected():
+            await uc.disconnect()
+
+    return force_stopped
 # ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
@@ -1646,7 +1874,7 @@ async def start_health_server():
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global db_pool, bot_client, logger_client
+    global db_pool, bot_client, logger_client, BOT_USERNAME, LOGGER_BOT_USERNAME
 
     missing = []
     if not API_ID:       missing.append("API_ID")
@@ -1704,6 +1932,26 @@ async def main() -> None:
             bot_client = TelegramClient(StringSession(""), API_ID, API_HASH)
             _register_handlers(bot_client)
     logger.info("Ads Bot is live.")
+    try:
+        me_ads = await bot_client.get_me()
+        if me_ads and me_ads.username:
+            if not BOT_USERNAME:
+                BOT_USERNAME = me_ads.username
+                logger.info(f"BOT_USERNAME auto-set to @{BOT_USERNAME}")
+            elif BOT_USERNAME.lower() != me_ads.username.lower():
+                logger.warning(
+                    f"BOT_USERNAME env (@{BOT_USERNAME}) != actual (@{me_ads.username}) — using actual"
+                )
+                BOT_USERNAME = me_ads.username
+    except Exception as e:
+        logger.warning(f"Could not resolve Ads Bot username: {e}")
+
+    # Clear stuck "running" from a previous crash (no worker is alive yet)
+    async with db_pool.acquire() as conn:
+        cleared = await conn.execute(
+            "UPDATE user_settings SET status='stopped' WHERE status='running'"
+        )
+        logger.info(f"Reset stuck running jobs: {cleared}")
 
     # ---- Start Logger Bot (separate token) ----
     if LOGGER_BOT_TOKEN:
@@ -1730,6 +1978,8 @@ async def main() -> None:
                 )
         me = await logger_client.get_me()
         logger.info(f"Logger Bot is live (@{me.username}).")
+        if me.username and not LOGGER_BOT_USERNAME:
+            LOGGER_BOT_USERNAME = me.username
 
     try:
         if logger_client:

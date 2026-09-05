@@ -62,9 +62,9 @@ LOG_PATH = os.path.join(DATA_DIR, "app.log")
 
 # Welcome / landing banner (Tecxo-style photo + Start Bot card)
 _ASSETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
-WELCOME_BANNER = os.getenv(
-    "WELCOME_BANNER",
-    os.path.join(_ASSETS_DIR, "welcome_banner.png"),
+_banner_env = os.getenv("WELCOME_BANNER", "").strip()
+WELCOME_BANNER = os.path.abspath(
+    _banner_env if _banner_env else os.path.join(_ASSETS_DIR, "welcome_banner.png")
 )
 
 # ---------------------------------------------------------------------------
@@ -309,10 +309,23 @@ def main_menu(settings: dict):
 
 async def _send_welcome(event) -> None:
     """Send Tecxo-style photo card with Start Bot button."""
-    kwargs = {"buttons": welcome_buttons()}
+    caption = welcome_caption()
+    buttons = welcome_buttons()
     if os.path.isfile(WELCOME_BANNER):
-        kwargs["file"] = WELCOME_BANNER
-    await event.respond(welcome_caption(), **kwargs)
+        try:
+            await event.client.send_file(
+                event.chat_id,
+                WELCOME_BANNER,
+                caption=caption,
+                buttons=buttons,
+                force_document=False,
+            )
+            return
+        except Exception as e:
+            logger.error(f"Welcome banner send failed ({WELCOME_BANNER}): {e}")
+    else:
+        logger.warning(f"Welcome banner not found at: {WELCOME_BANNER}")
+    await event.respond(caption, buttons=buttons)
 
 
 # ---------------------------------------------------------------------------
@@ -1575,6 +1588,10 @@ async def main() -> None:
     _register_handlers(bot_client)
 
     logger.info("Starting Ads Bot…")
+    if os.path.isfile(WELCOME_BANNER):
+        logger.info(f"Welcome banner ready: {WELCOME_BANNER}")
+    else:
+        logger.warning(f"Welcome banner MISSING — /start will be text-only: {WELCOME_BANNER}")
     while True:
         try:
             await bot_client.start(bot_token=BOT_TOKEN)

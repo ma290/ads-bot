@@ -16,8 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application source
+# Copy application source + welcome banner assets
 COPY main.py .
+COPY assets/ ./assets/
 
 # Create volume mount point for Telethon session files
 RUN mkdir -p /app/data

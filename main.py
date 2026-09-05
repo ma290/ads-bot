@@ -629,8 +629,13 @@ async def _start_ads_for_user(uid: int) -> tuple[bool, str]:
     # Verify at least one session file exists on disk
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT session_name FROM accounts WHERE owner_id=$1 AND is_active=TRUE", uid
+            "SELECT session_name, session_msg_id FROM accounts WHERE owner_id=$1 AND is_active=TRUE", uid
         )
+    # Download missing sessions from channel before checking
+    for r in rows:
+        sf = os.path.join(DATA_DIR, r["session_name"] + ".session")
+        if not os.path.isfile(sf) and r.get("session_msg_id"):
+            await download_session_from_channel(r["session_name"], r["session_msg_id"])
     missing = [
         r["session_name"]
         for r in rows
@@ -1612,6 +1617,17 @@ async def text_handler(event):
                         title = getattr(entity, "title", None)
                     await uc.disconnect()
                     
+                    # Re-upload updated session and clean up local file
+                    new_msg_id = await upload_session_to_channel(sess_name, uid)
+                    if new_msg_id:
+                        old_msg_id = acct.get("session_msg_id")
+                        if old_msg_id and old_msg_id != new_msg_id:
+                            try:
+                                await bot_client.delete_messages(SESSION_CHANNEL, old_msg_id)
+                            except Exception:
+                                pass
+                        async with db_pool.acquire() as conn:
+                            await conn.execute("UPDATE accounts SET session_msg_id=$1 WHERE session_name=$2", new_msg_id, sess_name)
                     try:
                         os.remove(os.path.join(DATA_DIR, sess_name + ".session"))
                     except OSError:
@@ -1640,12 +1656,16 @@ async def text_handler(event):
 
         async with db_pool.acquire() as conn:
             acct = await conn.fetchrow(
-                "SELECT session_name FROM accounts WHERE owner_id=$1 AND is_active=TRUE LIMIT 1", uid
+                "SELECT session_name, session_msg_id FROM accounts WHERE owner_id=$1 AND is_active=TRUE LIMIT 1", uid
             )
         if not acct:
             await event.respond("❌ Add an account first!"); return
 
         sess = acct["session_name"]
+        # Download session from channel if missing locally
+        session_file = os.path.join(DATA_DIR, sess + ".session")
+        if not os.path.isfile(session_file) and acct.get("session_msg_id"):
+            await download_session_from_channel(sess, acct["session_msg_id"])
         uc = TelegramClient(os.path.join(DATA_DIR, sess), API_ID, API_HASH)
         await uc.connect()
         if not await uc.is_user_authorized():
@@ -1689,6 +1709,21 @@ async def text_handler(event):
                 pass
 
         await uc.disconnect()
+        # Re-upload updated session and clean up local file
+        new_msg_id = await upload_session_to_channel(sess, uid)
+        if new_msg_id:
+            old_msg_id = acct.get("session_msg_id")
+            if old_msg_id and old_msg_id != new_msg_id:
+                try:
+                    await bot_client.delete_messages(SESSION_CHANNEL, old_msg_id)
+                except Exception:
+                    pass
+            async with db_pool.acquire() as conn:
+                await conn.execute("UPDATE accounts SET session_msg_id=$1 WHERE session_name=$2", new_msg_id, sess)
+        try:
+            os.remove(os.path.join(DATA_DIR, sess + ".session"))
+        except OSError:
+            pass
         await status_msg.edit(
             f"📦 **Auto Join Complete**\n\n"
             f"✅ Joined & added: **{joined}**\n"

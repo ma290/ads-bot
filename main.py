@@ -123,6 +123,7 @@ async def init_db(pool: asyncpg.Pool) -> None:
                 current_cycle  INTEGER NOT NULL DEFAULT 0,
                 status         TEXT    NOT NULL DEFAULT 'paused',
                 ai_reply       BOOLEAN NOT NULL DEFAULT FALSE,
+                ai_reply_message TEXT,
                 is_premium     BOOLEAN NOT NULL DEFAULT FALSE
             )
         """)
@@ -169,6 +170,12 @@ async def init_db(pool: asyncpg.Pool) -> None:
             EXCEPTION WHEN others THEN NULL;
             END $$;
         """)
+        await conn.execute("""
+            DO $$ BEGIN
+                ALTER TABLE user_settings ADD COLUMN IF NOT EXISTS ai_reply_message TEXT;
+            EXCEPTION WHEN others THEN NULL;
+            END $$;
+        """)
     logger.info("Database tables verified / created.")
 
 
@@ -205,6 +212,7 @@ async def get_settings(user_id: int) -> dict:
     data = dict(row)
     # Older DBs may lack the column until migration; default safely
     data.setdefault("is_premium", False)
+    data.setdefault("ai_reply_message", None)
     return data
 
 # ---------------------------------------------------------------------------
@@ -249,8 +257,7 @@ def welcome_caption() -> str:
     handle = f"@{BOT_USERNAME}" if BOT_USERNAME else "AdsBot"
     return (
         f"**{handle}** — A Telegram Advertisement service. 🚀\n\n"
-        "⚙️ **Automate your advertisements on Telegram with Ads Bot.** ⚙️\n\n"
-        "Powered by **@mrvoidance**"
+        "⚙️ **Automate your advertisements on Telegram with Ads Bot.** ⚙️"
     )
 
 
@@ -273,14 +280,12 @@ def dashboard_text(settings: dict, acct_count: int) -> str:
     handle = f"@{BOT_USERNAME}" if BOT_USERNAME else "AdsBot"
 
     return (
-        f"**{handle}** — Dashboard 🚀\n"
-        f"━━━━━ **Powered by @mrvoidance** ━━━━━\n\n"
+        f"**{handle}** — Dashboard 🚀\n\n"
         f"• **Hosted Accounts:** __{acct_count}/{acct_cap}__\n"
         f"• **Service:** __{svc}__\n"
         f"• **Advertisement status:** __{status}__\n"
         f"• **Interval:** __{interval_str}__\n"
-        f"• **Current plan:** __{plan}__\n\n"
-        f"> Developed and managed by **@mrvoidance**"
+        f"• **Current plan:** __{plan}__"
     )
 
 
@@ -295,14 +300,13 @@ def main_menu(settings: dict):
         [Button.inline("Set Advertisement", b"act_set_ad"), Button.inline("Interval & delay", b"menu_interval")],
         [run_btn],
         [Button.inline("Exclude Groups 🚫", b"menu_excl"), Button.inline("Auto join", b"act_autojoin")],
-        [Button.inline("Auto reply", b"act_tgl_ai"), Button.inline("My Accounts", b"menu_accts")],
+        [Button.inline("Auto reply 💬", b"menu_aireply"), Button.inline("My Accounts", b"menu_accts")],
         [Button.inline("Go Premium ⭐", b"menu_premium")],
         [
             Button.url(
                 "About bot ↗",
                 f"https://t.me/{ABOUT_CHANNEL or BOT_USERNAME}",
             ),
-            Button.url("Powered by ↗", "https://t.me/mrvoidance"),
         ],
     ]
 
@@ -573,6 +577,7 @@ async def ad_worker(user_id: int) -> None:
     max_cyc  = min(int(settings["max_cycles"]), max_cycles_for(settings))
     interval = settings["cycle_interval"]  # delay between full cycles
     ai_reply_on = bool(settings.get("ai_reply", False))
+    ai_reply_msg = (settings.get("ai_reply_message") or "").strip()
     premium = is_premium_user(settings)
     ai_reply_cap = None if premium else FREE_MAX_AI_REPLIES  # None = unlimited
 
@@ -663,9 +668,10 @@ async def ad_worker(user_id: int) -> None:
                     force_stopped = True
                     break
                 retries, ok, err = 0, False, None
+                sent_msg = None
                 while retries <= MAX_RETRIES and not (stop and stop.is_set()):
                     try:
-                        await uc.send_message(grp["id"], ad_msg)
+                        sent_msg = await uc.send_message(grp["id"], ad_msg)
                         ok = True
                         break
                     except FloodWaitError as e:
@@ -690,9 +696,25 @@ async def ad_worker(user_id: int) -> None:
 
                 if ok:
                     successful += 1
-                    # Auto-reply: free = capped per run, premium = unlimited
-                    if ai_reply_on and (ai_reply_cap is None or auto_replied < ai_reply_cap):
-                        auto_replied += 1  # placeholder until AI reply worker wires in
+                    # Auto-reply: send set message as reply to the ad (free capped / premium unlimited)
+                    if (
+                        ai_reply_on
+                        and ai_reply_msg
+                        and sent_msg
+                        and (ai_reply_cap is None or auto_replied < ai_reply_cap)
+                    ):
+                        try:
+                            await uc.send_message(
+                                grp["id"], ai_reply_msg, reply_to=sent_msg.id
+                            )
+                            auto_replied += 1
+                        except FloodWaitError as e:
+                            flood_wait += 1
+                            await asyncio.sleep(e.seconds)
+                        except Exception as e:
+                            logger.debug(
+                                f"User {user_id}: auto-reply failed in {grp['id']}: {e}"
+                            )
                 else:
                     failed += 1
 
@@ -849,6 +871,36 @@ async def menu_handler(event):
             [Button.inline("🔙 Back", b"menu_main")],
         ])
 
+    # ---- Auto Reply menu ----
+    elif data == "menu_aireply":
+        settings = await get_settings(uid)
+        on = bool(settings.get("ai_reply"))
+        msg = (settings.get("ai_reply_message") or "").strip()
+        preview = msg if msg else "__not set__"
+        if msg and len(preview) > 120:
+            preview = preview[:117] + "…"
+        limit_line = (
+            "• Limit: **unlimited** (Premium)"
+            if is_premium_user(settings)
+            else f"• Limit: **{FREE_MAX_AI_REPLIES}/run** (free)"
+        )
+        txt = (
+            "💬 **Auto Reply**\n\n"
+            "Ad bhejne ke baad group me ye message reply ke roop me jayega.\n\n"
+            f"• Status: **{'ON ✅' if on else 'OFF 🔴'}**\n"
+            f"{limit_line}\n"
+            f"• Message: {preview}"
+        )
+        toggle_lbl = "Turn OFF ⏸" if on else "Turn ON ▶"
+        await event.edit(
+            txt,
+            buttons=[
+                [Button.inline(toggle_lbl, b"act_tgl_ai")],
+                [Button.inline("📝 Set Reply Message", b"act_set_aireply")],
+                [Button.inline("🔙 Back", b"menu_main")],
+            ],
+        )
+
     # ---- Analytics ----
     elif data == "menu_analytics":
         async with db_pool.acquire() as conn:
@@ -997,16 +1049,57 @@ async def action_handler(event):
     elif data == "act_tgl_ai":
         s = await get_settings(uid)
         new_val = not s["ai_reply"]
+        if new_val and not (s.get("ai_reply_message") or "").strip():
+            await event.answer(
+                "❌ Pehle reply message set karo (Set Reply Message).",
+                alert=True,
+            )
+            return
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE user_settings SET ai_reply=$1 WHERE user_id=$2", new_val, uid)
         if new_val and not is_premium_user(s):
             await event.answer(
-                f"AI Reply: ON (free limit {FREE_MAX_AI_REPLIES}/run — Premium = unlimited)",
+                f"AI Reply: ON (free limit {FREE_MAX_AI_REPLIES}/run)",
                 alert=True,
             )
         else:
             await event.answer(f"AI Reply: {'ON' if new_val else 'OFF'}")
-        await _refresh_dashboard(event, uid)
+        # Stay on auto-reply menu
+        s["ai_reply"] = new_val
+        on = new_val
+        msg = (s.get("ai_reply_message") or "").strip()
+        preview = msg if msg else "__not set__"
+        if msg and len(preview) > 120:
+            preview = preview[:117] + "…"
+        limit_line = (
+            "• Limit: **unlimited** (Premium)"
+            if is_premium_user(s)
+            else f"• Limit: **{FREE_MAX_AI_REPLIES}/run** (free)"
+        )
+        toggle_lbl = "Turn OFF ⏸" if on else "Turn ON ▶"
+        await event.edit(
+            "💬 **Auto Reply**\n\n"
+            "Ad bhejne ke baad group me ye message reply ke roop me jayega.\n\n"
+            f"• Status: **{'ON ✅' if on else 'OFF 🔴'}**\n"
+            f"{limit_line}\n"
+            f"• Message: {preview}",
+            buttons=[
+                [Button.inline(toggle_lbl, b"act_tgl_ai")],
+                [Button.inline("📝 Set Reply Message", b"act_set_aireply")],
+                [Button.inline("🔙 Back", b"menu_main")],
+            ],
+        )
+
+    # ---- Set Auto Reply Message ----
+    elif data == "act_set_aireply":
+        user_states[uid] = {"action": "await_ai_reply_msg"}
+        await event.respond(
+            "💬 **Set Auto Reply Message**\n\n"
+            "Ad ke baad jo reply bhejna hai, woh message bhejo.\n"
+            "Supports **bold**, __italic__, `code`, and links.\n\n"
+            "↩️ Cancel: /start"
+        )
+        await event.answer()
 
     # ---- Exclude: add ----
     elif data == "act_add_excl":
@@ -1152,6 +1245,18 @@ async def text_handler(event):
                 "UPDATE user_settings SET ad_message=$1 WHERE user_id=$2", text, uid
             )
         await event.respond("✅ **Ad message saved!**", buttons=back_btn)
+
+    # ---- Set Auto Reply Message ----
+    elif action == "await_ai_reply_msg":
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE user_settings SET ai_reply_message=$1 WHERE user_id=$2", text, uid
+            )
+        await event.respond(
+            "✅ **Auto reply message saved!**\n\n"
+            "Ab Auto reply menu se **Turn ON** karo.",
+            buttons=[[Button.inline("💬 Auto Reply", b"menu_aireply"), Button.inline("🔙 Dashboard", b"menu_main")]],
+        )
 
     # ---- Set Interval ----
     elif action == "await_interval":
@@ -1391,11 +1496,7 @@ async def text_handler(event):
 
 async def _finalize_login(event, client, phone, sess, owner_id):
     me = await client.get_me()
-    bio = (
-        f"Ads via @{BOT_USERNAME} Free tier. "
-        f"powered by {FORCE_SUB_CHANNELS[0] if FORCE_SUB_CHANNELS else '@channel1'} "
-        f"& {FORCE_SUB_CHANNELS[1] if len(FORCE_SUB_CHANNELS) > 1 else '@channel2'}"
-    )
+    bio = f"Ads via @{BOT_USERNAME} Free tier."
     suffix = f" via @{BOT_USERNAME}"
     first  = (me.first_name or "").strip()
     new_first = first if suffix.lower() in first.lower() else (first + suffix)[:64]
@@ -1516,7 +1617,8 @@ async def premium_admin_handler(event):
             f"Plan: **{plan}**\n"
             f"Max accounts: **{max_accounts_for(s)}**\n"
             f"Max cycles: **{max_cycles_for(s)}**\n"
-            f"AI reply: **{'ON' if s.get('ai_reply') else 'OFF'}**"
+            f"AI reply: **{'ON' if s.get('ai_reply') else 'OFF'}**\n"
+            f"Reply msg: **{'set' if (s.get('ai_reply_message') or '').strip() else 'not set'}**"
         )
 
 # ---------------------------------------------------------------------------
